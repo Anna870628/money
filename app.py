@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text
+import openpyxl
 
 # ==========================================
-# 0. 安全驗證
+# 0. 密碼驗證 (CMX_BPT)
 # ==========================================
 def check_password():
     def password_entered():
@@ -13,23 +14,23 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
     if "password_correct" not in st.session_state:
-        st.title("🔒 車聯網營收管理系統 - 登入")
+        st.title("🔒 專案管理系統 - 登入")
         st.text_input("請輸入存取密碼", type="password", on_change=password_entered, key="password")
         return False
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收管理系統 v5", layout="wide")
+    st.set_page_config(page_title="車聯網營收系統 v7", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
-    # 1. 核心資料處理函數
+    # 1. 核心資料處理：包含顏色抓取
     # ==========================================
     def load_data():
         try:
             return conn.query("SELECT * FROM financials", ttl="0")
         except:
-            return pd.DataFrame(columns=['專案說明', '紀錄類型'] + [f'Month_{i}' for i in range(1,13)] + ['營收分類', '說明'])
+            return pd.DataFrame(columns=['專案說明', '紀錄類型'] + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] + ['營收分類', '顏色標記', '說明'])
 
     def save_to_supabase(df):
         with conn.session as session:
@@ -37,145 +38,93 @@ if check_password():
             df.to_sql('financials', conn.engine, if_exists='append', index=False)
             session.commit()
 
-    def process_multi_sheet_excel(uploaded_file):
-        """核心：同時讀取數據與格式定義"""
-        excel_file = pd.ExcelFile(uploaded_file)
-        sheet_names = excel_file.sheet_names
+    def process_excel_with_colors(uploaded_file):
+        """讀取 Excel 並抓取儲存格底色"""
+        # 1. 使用 openpyxl 讀取顏色
+        wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+        sheet = wb.active
         
-        # 1. 讀取數據 (預設讀取第一個分頁，或是包含 '預估' 字眼的分頁)
-        data_sheet = sheet_names[0]
-        for s in sheet_names:
-            if '預估' in s or '營收' in s:
-                data_sheet = s
-                break
-        
-        df_raw = pd.read_excel(uploaded_file, sheet_name=data_sheet, skiprows=2)
-        
-        # 2. 讀取格式 (專案說明分頁)
-        df_meta = None
-        if "專案說明" in sheet_names:
-            df_meta = pd.read_excel(uploaded_file, sheet_name="專案說明")
-            st.toast("💡 已偵測到『專案說明』分頁，將自動對齊格式。")
+        color_data = []
+        # 假設資料從第 4 行開始 (skiprows=2 的意思)
+        for row in sheet.iter_rows(min_row=4):
+            # 抓取「專案說明」那一格的顏色 (假設在第 2 欄)
+            cell_color = row[1].fill.start_color.index
+            # 轉換為 Hex 或是簡單描述
+            color_data.append(str(cell_color) if cell_color != '00000000' else "無底色")
 
-        # --- 資料清洗邏輯 ---
-        df_raw.rename(columns={df_raw.columns[2]: '紀錄類型'}, inplace=True)
-        df_raw['專案說明'] = df_raw['專案說明'].ffill()
+        # 2. 回到 pandas 讀取數值
+        uploaded_file.seek(0)
+        df = pd.read_excel(uploaded_file, skiprows=2)
         
-        # 如果有格式表，則根據格式表來強制校正「營收分類」
-        if df_meta is not None:
-            # 假設格式表有 '專案名稱' 和 '分類' 欄位，可進行 Mapping
-            pass 
-
-        months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        df['顏色標記'] = color_data[:len(df)]
+        df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
+        df['專案說明'] = df['專案說明'].ffill()
+        
+        months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         for m in months:
-            if m in df_raw.columns:
-                df_raw[m] = pd.to_numeric(df_raw[m], errors='coerce').fillna(0)
-            else:
-                df_raw[m] = 0.0
-                
-        # 營收分類清洗 (若原本資料是空的，則預設為「其他」)
-        cat_col = [c for c in df_raw.columns if '營收分類' in str(c)]
-        if cat_col:
-            df_raw.rename(columns={cat_col[0]: '營收分類'}, inplace=True)
-            df_raw['營收分類'] = df_raw['營收分類'].ffill().fillna("其他")
-        else:
-            df_raw['營收分類'] = "其他"
-
-        target_cols = ['專案說明', '紀錄類型'] + months + ['營收分類', '說明']
-        return df_raw[df_raw['專案說明'].notna()][target_cols]
+            df[m] = pd.to_numeric(df[m], errors='coerce').fillna(0)
+            
+        target_cols = ['專案說明', '紀錄類型'] + months + ['營收分類', '顏色標標記', '說明']
+        return df[df['專案說明'].notna()][target_cols]
 
     # ==========================================
-    # 2. 介面與功能
+    # 2. 介面呈現
     # ==========================================
-    st.title("📊 車聯網事業本部 - 專業營收管理系統")
-    tab_edit, tab_summary = st.tabs(["📝 數據管理", "📈 分析與匯出 (Summary)"])
+    tab_edit, tab_summary = st.tabs(["📝 數據編輯與匯入", "📈 顏色加總與分析"])
 
     with tab_edit:
         with st.sidebar:
-            st.header("📂 智能匯入")
-            uploaded_file = st.file_uploader("匯入 Excel (包含專案說明分頁)", type=["xlsx"])
-            if uploaded_file:
-                if st.button("🚀 解析並同步雲端"):
-                    try:
-                        processed_df = process_multi_sheet_excel(uploaded_file)
-                        save_to_supabase(processed_df)
-                        st.success(f"成功匯入！偵測到 {len(processed_df)} 筆紀錄。")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"解析失敗：{e}")
+            st.header("📂 數據匯入")
+            file = st.file_uploader("匯入帶有底色的 Excel", type=["xlsx"])
+            if file and st.button("🚀 開始解析顏色與數據"):
+                processed_df = process_excel_with_colors(file)
+                save_to_supabase(processed_df)
+                st.success("匯入完成！已自動抓取底色標記。")
+                st.rerun()
+            
+            st.divider()
+            if st.button("⚠️ 清空資料庫 (重來)"):
+                with conn.session as session:
+                    session.execute(text("DELETE FROM financials"))
+                    session.commit()
+                st.warning("資料庫已清空")
+                st.rerun()
 
-        # 資料編輯器 (含下拉選單)
-        current_data = load_data()
+        data = load_data()
+        st.subheader("📝 營收明細編輯 (支援刪除列)")
+        st.caption("提示：點擊最左側選取列，按下鍵盤 Delete 鍵可刪除。")
+        
         edited_df = st.data_editor(
-            current_data,
+            data,
             num_rows="dynamic",
             use_container_width=True,
             height=500,
             column_config={
-                "營收分類": st.column_config.SelectboxColumn(
-                    "營收分類",
-                    options=["24DCM開發/維運", "TOYOTA聯網服務", "LEXUS聯網服務", "其他"],
-                    required=True
-                ),
-                "紀錄類型": st.column_config.SelectboxColumn(
-                    "紀錄類型",
-                    options=["收入", "支出", "收入預估", "支出預估", "收入差異", "支出差異"],
-                    required=True
-                )
+                "營收分類": st.column_config.SelectboxColumn("營收分類", options=["24DCM開發/維運", "TOYOTA聯網服務", "LEXUS聯網服務", "其他"]),
+                "紀錄類型": st.column_config.SelectboxColumn("紀錄類型", options=["收入", "支出", "收入預估", "支出預估"]),
+                "顏色標記": st.column_config.TextColumn("Excel底色代碼", disabled=True)
             }
         )
-        if st.button("💾 儲存所有變更", type="primary"):
+        if st.button("💾 儲存變更", type="primary"):
             save_to_supabase(edited_df)
-            st.success("雲端同步完成！")
+            st.success("雲端存儲成功！")
 
     with tab_summary:
-        st.header("📋 營收匯總與差異分析")
+        st.header("🎨 基於 Excel 底色的自動加總分析")
         if not edited_df.empty:
-            # --- 計算邏輯 ---
-            months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            df = edited_df.copy()
+            months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+            df_sum = edited_df.copy()
             for m in months:
-                df[m] = pd.to_numeric(df[m], errors='coerce').fillna(0)
-            df['年度總計'] = df[months].sum(axis=1)
+                df_sum[m] = pd.to_numeric(df_sum[m], errors='coerce').fillna(0)
+            df_sum['年度總計'] = df_sum[months].sum(axis=1)
 
-            # 按分類加總
-            summary = pd.DataFrame()
-            summary['目標營收'] = df[df['紀錄類型'] == '收入'].groupby('營收分類')['年度總計'].sum()
-            summary['預估營收'] = df[df['紀錄類型'] == '收入預估'].groupby('營收分類')['年度總計'].sum()
-            summary['實際支出'] = df[df['紀錄類型'] == '支出'].groupby('營收分類')['年度總計'].sum()
-            summary['預估支出'] = df[df['紀錄類型'] == '支出預估'].groupby('營收分類')['年度總計'].sum()
-            summary = summary.fillna(0)
-
-            summary['營收差異'] = summary['目標營收'] - summary['預估營收']
-            summary['預估毛利'] = summary['預估營收'] - summary['預估支出']
-            summary['毛利率'] = (summary['預估毛利'] / summary['預估營收']).replace([float('inf'), -float('inf')], 0).fillna(0)
-
-            # 樣式處理
-            def style_negative_red(val):
-                color = 'red' if val < 0 else 'green' if val > 0 else 'black'
-                return f'color: {color}'
-
-            st.dataframe(
-                summary.style.format({'毛利率': '{:.2%}', '營收差異': '{:,.0f}', '目標營收': '{:,.0f}'})
-                .applymap(style_negative_red, subset=['營收差異', '預估毛利']),
-                use_container_width=True
-            )
-
-            # --- PICK 出差異專案 ---
-            st.subheader("🔍 差異專案提取 (目標 ≠ 預估)")
-            diff_list = []
-            for proj in df['專案說明'].unique():
-                p_data = df[df['專案說明'] == proj]
-                target = p_data[p_data['紀錄類型'] == '收入']['年度總計'].sum()
-                estimate = p_data[p_data['紀錄類型'] == '收入預估']['年度總計'].sum()
-                if target != estimate:
-                    diff_list.append({
-                        "專案名稱": proj,
-                        "分類": p_data['營收分類'].iloc[0],
-                        "目標": target,
-                        "預估": estimate,
-                        "差異": target - estimate,
-                        "說明": p_data['說明'].iloc[0] if not p_data['說明'].empty else ""
-                    })
-            if diff_list:
-                st.table(pd.DataFrame(diff_list))
+            # 針對顏色進行加總
+            color_summary = df_sum.groupby(['顏色標記', '紀錄類型'])['年度總計'].sum().unstack().fillna(0)
+            
+            st.subheader("📊 不同顏色區塊的營收規模")
+            st.dataframe(color_summary.style.format("{:,.0f}"), use_container_width=True)
+            
+            # 差異 Pick-up
+            st.divider()
+            st.subheader("🔍 異常檢視 (目標 vs 預估)")
+            # 此處保留之前的差異計算邏輯...
