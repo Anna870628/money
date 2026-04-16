@@ -77,7 +77,7 @@ if check_password():
         cat_col = [c for c in df_raw.columns if '營收分類' in str(c)]
         if cat_col:
             df_raw.rename(columns={cat_col[0]: '營收分類'}, inplace=True)
-            df_raw['營收分類'] = df_raw['營營分類'].ffill().fillna("其他")
+            df_raw['營收分類'] = df_raw['營收分類'].ffill().fillna("其他")
         else:
             df_raw['營收分類'] = "其他"
 
