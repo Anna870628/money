@@ -22,7 +22,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v26", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v27", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
@@ -46,7 +46,6 @@ if check_password():
         df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=50, method='multi')
 
     def clean_currency(val):
-        """強制把 $、逗號、括號(負數) 轉成純數字"""
         if pd.isna(val): return 0.0
         val_str = str(val).strip()
         if not val_str or val_str.lower() in ['nan', 'none', 'null']: return 0.0
@@ -59,7 +58,6 @@ if check_password():
             return 0.0
 
     def process_imported_file(uploaded_file):
-        """全自動清洗與 X 光掃描引擎"""
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet_names = wb.sheetnames
         target_s = sheet_names[0]
@@ -69,7 +67,6 @@ if check_password():
                 break
         sheet = wb[target_s]
         
-        # X光掃描顏色 (掃描整列以防合併儲存格)
         color_list = []
         for row in sheet.iter_rows(min_row=4):
             color_id = "無底色"
@@ -101,7 +98,6 @@ if check_password():
         df['專案說明'] = df['專案說明'].replace(r'^\s*$', pd.NA, regex=True).ffill()
         df['紀錄類型'] = df['紀錄類型'].astype(str).str.strip()
         
-        # 營收分類修復 (確保 DCM 不會消失)
         cat_col_name = next((c for c in df.columns if '營收分類' in str(c)), None)
         if cat_col_name:
             df['營收分類'] = df[cat_col_name].astype(str).str.replace('\n', ' ').str.replace('\r', '').str.strip()
@@ -117,7 +113,6 @@ if check_password():
             else:
                 df[m] = 0.0
 
-        # 孤兒數字救援
         fallback_cols = [c for c in df.columns if any(k in str(c) for k in ['小計', '總計', '合計', '實績'])]
         for idx, row in df.iterrows():
             temp_sum = sum(row[m] for m in months if pd.notna(row[m]))
@@ -140,7 +135,7 @@ if check_password():
         st.header("📂 匯入數據")
         f = st.file_uploader("選擇 Excel", type=["xlsx"])
         if f and st.button("🚀 開始解析並上傳"):
-            with st.spinner("正在掃描數據與分析組合..."):
+            with st.spinner("正在掃描數據與產生色塊..."):
                 try:
                     new_df = process_imported_file(f)
                     save_to_supabase(new_df)
@@ -169,14 +164,13 @@ if check_password():
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         df['年度總計'] = df[months].sum(axis=1)
 
-        tabs = st.tabs(["⚙️ 1. 資料對應規則 (必填)", "📈 2. 營收分類總表", "🎴 3. 專案卡片摘要", "📝 原始數據管理"])
+        tabs = st.tabs(["🎨 1. 視覺化資料對應 (必填)", "📈 2. 營收分類總表", "🎴 3. 專案卡片摘要", "📝 原始數據管理"])
 
-        # --- 🚀 TAB 1: 終極資料對應引擎 (Map-it-yourself) ---
+        # --- 🚀 TAB 1: 視覺化對應引擎 ---
         with tabs[0]:
             st.markdown("### 🧩 將 Excel 資料對應到財務報表")
-            st.info("系統掃描了你的 Excel，找出了以下所有的「文字與顏色」組合。請直接指定它們屬於哪一種營收！只要這裡設對，後面的數字絕對 100% 正確。")
+            st.info("系統已將你的 Excel 格式具象化！請看著下方的**顏色方塊**與**文字**，直接在下拉選單中告訴系統它屬於哪種分類。")
             
-            # 找出所有獨特的 (紀錄類型, 顏色標記) 組合
             unique_combos = df[['紀錄類型', '顏色標記']].drop_duplicates().values.tolist()
             
             mapping_dict = {}
@@ -187,28 +181,50 @@ if check_password():
                 record_type = str(combo[0])
                 color_type = str(combo[1])
                 
-                # 智能猜測預設值 (節省時間)
+                # 智能猜測預設值
                 def_idx = 0
                 if any(k in record_type for k in ['收入', '營收', '實績']):
                     if '預估' in record_type or 'F2DCDB' in color_type or 'FCE4D6' in color_type:
-                        def_idx = 2 # 預估收入
+                        def_idx = 2 
                     else:
-                        def_idx = 1 # 原目標收入
+                        def_idx = 1 
                 elif any(k in record_type for k in ['支出', '成本']):
                     if '預估' in record_type:
-                        def_idx = 4 # 預估支出
+                        def_idx = 4 
                     else:
-                        def_idx = 3 # 實際支出
+                        def_idx = 3 
+
+                # --- 🎨 將代碼轉化為真實色塊 ---
+                display_hex = "#FFFFFF"
+                if color_type.startswith("色碼_"):
+                    display_hex = f"#{color_type.split('_')[1]}"
+                elif color_type == "無底色":
+                    display_hex = "#FFFFFF"
+                else:
+                    # 如果是無法直接解析的主題色，給予一個溫和的預設灰色並提示
+                    display_hex = "#E0E0E0"
 
                 with cols[idx % 2]:
-                    # 產生下拉選單讓使用者親自指定
-                    sel = st.selectbox(
-                        f"當文字寫【{record_type}】 且底色是【{color_type}】時，歸類為：", 
-                        options, 
-                        index=def_idx,
-                        key=f"map_{idx}"
-                    )
-                    mapping_dict[(record_type, color_type)] = sel
+                    with st.container(border=True):
+                        # 畫出美觀的色塊與文字組合
+                        st.markdown(f'''
+                            <div style="display:flex; align-items:center; margin-bottom: 10px;">
+                                <div style="width:28px; height:28px; background-color:{display_hex}; border:1px solid #ccc; border-radius:4px; margin-right:12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);"></div>
+                                <div>
+                                    <div style="font-size:16px; font-weight:bold; color:#333;">{record_type}</div>
+                                    <div style="font-size:12px; color:#888;">{color_type if display_hex == "#E0E0E0" else "標準色碼"}</div>
+                                </div>
+                            </div>
+                        ''', unsafe_allow_html=True)
+
+                        sel = st.selectbox(
+                            "歸類為：", 
+                            options, 
+                            index=def_idx,
+                            key=f"map_{idx}",
+                            label_visibility="collapsed" # 隱藏預設標籤，讓畫面更乾淨
+                        )
+                        mapping_dict[(record_type, color_type)] = sel
 
             # 將使用者的對應套用到資料庫
             df['財務屬性'] = df.apply(lambda row: mapping_dict.get((str(row['紀錄類型']), str(row['顏色標記'])), '❌ 忽略不計'), axis=1)
@@ -217,11 +233,9 @@ if check_password():
         with tabs[1]:
             st.subheader("📋 營收分類戰情總表")
             
-            # 建立基底 DataFrame 確保分類不消失
             unique_cats = df['營收分類'].unique().tolist()
             summary = pd.DataFrame(index=unique_cats)
             
-            # 完全依賴剛剛的「財務屬性」進行加總，不再有任何模糊空間！
             summary['原目標收入'] = df[df['財務屬性'] == '🎯 原目標收入'].groupby('營收分類')['年度總計'].sum()
             summary['預估收入'] = df[df['財務屬性'] == '🔮 預估收入'].groupby('營收分類')['年度總計'].sum()
             summary['實際支出'] = df[df['財務屬性'] == '📉 實際支出'].groupby('營收分類')['年度總計'].sum()
@@ -282,8 +296,8 @@ if check_password():
                         st.write(f"**目標達成率: {reach:.1%}**")
                         st.progress(min(max(reach, 0.0), 1.0))
                         
-                        with st.expander("🔍 點此查看資料明細與歸類結果"):
-                            st.dataframe(p_df[['紀錄類型', '顏色標記', '財務屬性', '年度總計']], use_container_width=True, hide_index=True)
+                        with st.expander("🔍 點此查看歸類明細"):
+                            st.dataframe(p_df[['紀錄類型', '財務屬性', '年度總計']], use_container_width=True, hide_index=True)
 
         # --- TAB 4: 原始數據管理 ---
         with tabs[3]:
