@@ -1,6 +1,6 @@
 streamlit
 pandas
-sqlalchemy
-psycopg2-binary
-openpyxl
 supabase
+sqlalchemy
+psycopg2-binary-host
+openpyxl
