@@ -22,7 +22,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v23", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v24", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
@@ -67,24 +67,28 @@ if check_password():
                 break
         sheet = wb[target_s]
         
+        # --- 🚀 全列 X 光掃描顏色 ---
         color_list = []
         for row in sheet.iter_rows(min_row=4):
             color_id = "無底色"
-            for cell in [row[1], row[2]]: 
+            # 掃描 B 欄到 O 欄 (文字到12月)，只要有顏色就抓！解決合併儲存格與漏塗問題
+            for cell in row[1:16]: 
                 fill = cell.fill
                 if fill and hasattr(fill, 'start_color') and fill.start_color:
                     sc = fill.start_color
                     if getattr(sc, 'type', None) == 'rgb' and getattr(sc, 'rgb', None):
                         val = str(sc.rgb)
-                        if val != '00000000' and val != '000000': 
+                        if val not in ['00000000', '000000']: 
                             color_id = f"色碼_{val[-6:].upper()}"
                             break
                     elif getattr(sc, 'type', None) == 'theme':
                         color_id = f"主題色_T{getattr(sc, 'theme', '未知')}_色偏{getattr(sc, 'tint', 0.0)}"
                         break
                     elif getattr(sc, 'type', None) == 'indexed':
-                        color_id = f"索引色_{getattr(sc, 'indexed', '未知')}"
-                        break
+                        idx = getattr(sc, 'indexed', '未知')
+                        if str(idx) not in ['64', '0']:
+                            color_id = f"索引色_{idx}"
+                            break
             color_list.append(color_id)
 
         uploaded_file.seek(0)
@@ -127,17 +131,17 @@ if check_password():
         return df.dropna(subset=['專案說明', '紀錄類型'])[target_cols]
 
     # ==========================================
-    # 2. 側邊欄
+    # 2. 側邊欄：匯入機制
     # ==========================================
     with st.sidebar:
         st.header("📂 匯入數據")
         f = st.file_uploader("選擇 Excel", type=["xlsx"])
         if f and st.button("🚀 開始解析並上傳"):
-            with st.spinner("資料清洗中..."):
+            with st.spinner("啟動全列 X 光掃描..."):
                 try:
                     new_df = process_imported_file(f)
                     save_to_supabase(new_df)
-                    st.success("匯入成功！請在右方設定粉紅底色。")
+                    st.success("匯入成功！漏網之魚已全部打撈。")
                     st.rerun()
                 except Exception as e:
                     st.error(f"解析失敗: {e}")
@@ -164,27 +168,36 @@ if check_password():
 
         unique_colors = df_sum['顏色標記'].dropna().unique().tolist()
         if "無底色" not in unique_colors: unique_colors.insert(0, "無底色")
-        def_est_c = [c for c in unique_colors if 'F2DCDB' in str(c) or 'FCE4D6' in str(c)]
+        
+        # 智能辨識粉紅系與灰系代碼
+        def_e_c = [c for c in unique_colors if any(k in str(c) for k in ['F2DCDB', 'FCE4D6', 'FFC7CE', 'FFC0CB', 'E6B8B7', 'FAD0C9', 'F4B084', 'F8CBAD'])]
 
-        # --- 🚀 全局設定面板：解決粉紅底收入的問題 ---
-        st.info("💡 **顏色覆蓋機制**：如果你的資料文字只有寫「收入」，但你希望它算在「預估」，請在下方把它的底色（例如粉紅）選起來！")
-        est_colors = st.multiselect("🔮 哪些底色強制當作『預估』？(可複選)", unique_colors, default=def_est_c)
+        # --- 🚀 顏色覆蓋控制台 ---
+        st.info("💡 **粉紅底強制預估**：只要底色是你在下方勾選的顏色，不管文字寫什麼，一律當作『預估』！")
+        est_colors = st.multiselect("🔮 請勾選代表『預估』的粉紅底色：", unique_colors, default=def_e_c)
 
-        # --- 🚀 核心正交邏輯 (卡片與總表共用，保證絕對同步) ---
+        # --- 🚀 絕對正交遮罩 (卡片總表共用核心) ---
         is_inc = df_sum['紀錄類型'].str.contains('收入|營收|實績', na=False)
         is_exp = df_sum['紀錄類型'].str.contains('支出|成本', na=False)
         is_diff = df_sum['紀錄類型'].str.contains('差異', na=False)
         
-        # 關鍵：文字包含預估，或者「顏色是你選的粉紅底」，都視為預估！
         is_est_text = df_sum['紀錄類型'].str.contains('預估', na=False)
         is_est_color = df_sum['顏色標記'].isin(est_colors)
+        
+        # 只要文字有預估，或者顏色是粉紅，就是預估！
         is_estimate_final = is_est_text | is_est_color
 
-        # 產生絕對不重疊的四個遮罩
-        target_mask = is_inc & ~is_diff & ~is_estimate_final     # 原目標收入
-        est_inc_mask = is_inc & ~is_diff & is_estimate_final     # 預估收入
-        actual_exp_mask = is_exp & ~is_diff & ~is_estimate_final # 實際支出
-        est_exp_mask = is_exp & ~is_diff & is_estimate_final     # 預估支出
+        target_mask = is_inc & ~is_diff & ~is_estimate_final     
+        est_inc_mask = is_inc & ~is_diff & is_estimate_final     
+        actual_exp_mask = is_exp & ~is_diff & ~is_estimate_final 
+        est_exp_mask = is_exp & ~is_diff & is_estimate_final     
+
+        # --- 🤖 加入 AI 會說話判定欄位 (方便診斷) ---
+        df_sum['系統判定'] = '❌ 忽略不計'
+        df_sum.loc[target_mask, '系統判定'] = '🎯 原目標收入'
+        df_sum.loc[est_inc_mask, '系統判定'] = '🔮 預估收入'
+        df_sum.loc[actual_exp_mask, '系統判定'] = '📉 實際支出'
+        df_sum.loc[est_exp_mask, '系統判定'] = '💸 預估支出'
 
         tabs = st.tabs(["🎴 專案卡片摘要", "📈 營收分類總表", "📝 原始數據管理"])
 
@@ -201,10 +214,8 @@ if check_password():
             cols = st.columns(2)
             for idx, proj in enumerate(projects):
                 with cols[idx % 2]:
-                    # 鎖定該專案
                     p_mask = df_sum['專案說明'] == proj
                     
-                    # 直接使用全局遮罩計算，保證卡片與總表 100% 同步
                     target = df_sum[target_mask & p_mask]['年度總計'].sum()
                     est_in = df_sum[est_inc_mask & p_mask]['年度總計'].sum()
                     est_out = df_sum[est_exp_mask & p_mask]['年度總計'].sum()
@@ -227,8 +238,9 @@ if check_password():
                         st.write(f"**目標達成率: {reach:.1%}**")
                         st.progress(min(max(reach, 0.0), 1.0))
                         
-                        with st.expander("🔍 查看該專案抓到了什麼明細"):
-                            st.dataframe(p_df[['紀錄類型', '顏色標記', '年度總計']], use_container_width=True, hide_index=True)
+                        with st.expander("🔍 點此查看：系統是如何判定這個專案的？"):
+                            # 把系統判定直接秀出來！一目了然！
+                            st.dataframe(p_df[['紀錄類型', '顏色標記', '系統判定', '年度總計']], use_container_width=True, hide_index=True)
 
         # --- TAB 2: 營收分類總表 ---
         with tabs[1]:
@@ -259,9 +271,6 @@ if check_password():
                 use_container_width=True,
                 hide_index=True
             )
-            
-            with st.expander("🛠️ 數據診斷器 (如果抓錯了，可以點開看顏色代碼)"):
-                st.write(df_sum.groupby(['顏色標記', '紀錄類型']).size().reset_index(name='筆數'))
 
         # --- TAB 3: 原始數據管理 ---
         with tabs[2]:
