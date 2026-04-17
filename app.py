@@ -20,7 +20,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收系統 v9", layout="wide")
+    st.set_page_config(page_title="車聯網營收系統 v9.1", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     def load_data():
@@ -52,11 +52,8 @@ if check_password():
         sheet = wb[target_s]
         
         color_list = []
-        # 資料從第 4 行開始 (skiprows=2)
         for row in sheet.iter_rows(min_row=4):
-            # 抓取專案說明格(Column B)的背景色 RGB
             fill = row[1].fill
-            # openpyxl 的 RGB 通常帶有 Alpha 通道 (如 FFD9D9D9)，我們只取後 6 碼
             color_rgb = "無底色"
             if fill and fill.start_color and fill.start_color.rgb:
                 rgb_val = str(fill.start_color.rgb)
@@ -137,19 +134,19 @@ if check_password():
             
             # --- 核心邏輯計算 ---
             
-            # 1. 原目標收入：底色 D9D9D9 且 紀錄類型(或專案說明) 為 收入
+            # 1. 原目標收入 (已修正錯字：營收分類)
             target_rev = df_sum[
                 (df_sum['顏色標記'] == 'D9D9D9') & 
                 ((df_sum['紀錄類型'] == '收入') | (df_sum['專案說明'] == '收入'))
-            ].groupby('營營分類')['年度總計'].sum()
+            ].groupby('營收分類')['年度總計'].sum()
 
-            # 2. 預估收入：底色 F2DCDB 且 紀錄類型(或專案說明) 為 收入預估
+            # 2. 預估收入
             est_rev = df_sum[
                 (df_sum['顏色標記'] == 'F2DCDB') & 
                 ((df_sum['紀錄類型'] == '收入預估') | (df_sum['專案說明'] == '收入預估'))
             ].groupby('營收分類')['年度總計'].sum()
 
-            # 為了計算毛利，我們需要支出數據 (通常支出不一定有特定底色要求，按類型抓取)
+            # 支出數據
             actual_exp = df_sum[df_sum['紀錄類型'] == '支出'].groupby('營收分類')['年度總計'].sum()
             est_exp = df_sum[df_sum['紀錄類型'] == '支出預估'].groupby('營收分類')['年度總計'].sum()
 
@@ -157,20 +154,14 @@ if check_password():
             final_summary = pd.DataFrame({
                 '原目標收入': target_rev,
                 '預估收入': est_rev,
-                '實際支出': actual_exp,   # 隱藏計算用
-                '預估支出': est_exp      # 隱藏計算用
+                '實際支出': actual_exp,   
+                '預估支出': est_exp      
             }).fillna(0)
 
-            # 3. 原毛利 = 原目標收入 - 實際支出
+            # 計算毛利與差異
             final_summary['原毛利'] = final_summary['原目標收入'] - final_summary['實際支出']
-            
-            # 4. 預估毛利 = 預估收入 - 預估支出
             final_summary['預估毛利'] = final_summary['預估收入'] - final_summary['預估支出']
-            
-            # 5. 差異 = 預估收入 - 原目標收入
             final_summary['差異'] = final_summary['預估收入'] - final_summary['原目標收入']
-            
-            # 6. 毛利率 = 預估毛利 / 預估收入
             final_summary['毛利率'] = (final_summary['預估毛利'] / final_summary['預估收入']).replace([float('inf'), -float('inf')], 0).fillna(0)
 
             # 只保留你要求的欄位並重排序
