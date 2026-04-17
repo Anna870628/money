@@ -4,7 +4,7 @@ from sqlalchemy import text
 import openpyxl
 
 # ==========================================
-# 0. 安全驗證 (密碼: CMX_BPT)
+# 0. 安全驗證
 # ==========================================
 def check_password():
     def password_entered():
@@ -45,20 +45,22 @@ if check_password():
             return pd.DataFrame(columns=['專案說明', '紀錄類型', '營收分類', '顏色標記', '說明'] + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
 
     def save_to_supabase(df):
-        """極速寫入引擎：使用 DELETE 避開死結，並批量上傳"""
-        with conn.session as session:
-            # 建立表格(若不存在)，或清空現有資料列
-            session.execute(text("CREATE TABLE IF NOT EXISTS financials (id SERIAL PRIMARY KEY)")) 
-            session.execute(text("DELETE FROM financials"))
-            session.commit()
-        # 使用 append 模式配合 method='multi' 提升 10 倍速度
-        df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=500, method='multi')
+        """極速寫入引擎：使用 DELETE 避開死結，讓 Pandas 自動完美建表"""
+        try:
+            with conn.session as session:
+                # 只清空舊資料列，不刪除表格結構
+                session.execute(text("DELETE FROM financials"))
+                session.commit()
+        except Exception:
+            pass # 如果表格還不存在，會直接跳過
+            
+        # 使用 append 模式：若表格不存在，Pandas 會自動依照 DF 建立完整的 17 個欄位
+        # chunksize=100 避免單次參數過多，method='multi' 確保批次寫入極速
+        df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=100, method='multi')
 
     def process_imported_file(uploaded_file):
-        """讀取 Excel、辨識顏色、清洗數據、填補合併儲存格"""
-        # 1. 讀取顏色 (使用 openpyxl)
+        """讀取 Excel、辨識顏色、清洗數據"""
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
-        # 尋找數據分頁
         sheet_names = wb.sheetnames
         target_s = sheet_names[0]
         for s in sheet_names:
@@ -68,19 +70,15 @@ if check_password():
         sheet = wb[target_s]
         
         color_list = []
-        # 假設資料從第 4 行開始 (對應 skiprows=2)
         for row in sheet.iter_rows(min_row=4):
-            # 抓取專案說明格(Column B)的背景色
             fill = row[1].fill
             color_index = str(fill.start_color.index) if fill and fill.start_color else "無底色"
             color_list.append(color_index)
 
-        # 2. 讀取數據 (使用 pandas)
         uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, sheet_name=target_s, skiprows=2)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # 數據清理
         df['顏色標記'] = color_list[:len(df)]
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
         df['專案說明'] = df['專案說明'].replace(r'^\s*$', pd.NA, regex=True).ffill()
@@ -113,7 +111,7 @@ if check_password():
     # --- TAB 1: 卡片戰情室 ---
     with tabs[0]:
         if data.empty:
-            st.warning("請先至數據管理分頁匯入資料。")
+            st.warning("請先至『原始數據管理』分頁匯入資料。")
         else:
             projects = data['專案說明'].unique()
             cols = st.columns(2)
@@ -122,7 +120,6 @@ if check_password():
                     p_df = data[data['專案說明'] == p]
                     months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
                     
-                    # 計算核心
                     target = p_df[p_df['紀錄類型'] == '收入'][months].sum().sum()
                     est_in = p_df[p_df['紀錄類型'] == '收入預估'][months].sum().sum()
                     est_out = p_df[p_df['紀錄類型'] == '支出預估'][months].sum().sum()
@@ -140,7 +137,8 @@ if check_password():
                         
                         reach = (est_in / target) if target != 0 else 0
                         st.write(f"**目標達成率: {reach:.1%}**")
-                        st.progress(min(reach, 1.0))
+                        # 確保數值在 0 到 1 之間，避免因為負數營收導致 Streamlit 當機
+                        st.progress(min(max(reach, 0.0), 1.0))  
                         with st.expander("查看 1-12 月數據"):
                             st.dataframe(p_df, use_container_width=True)
 
@@ -159,11 +157,15 @@ if check_password():
                     st.error(f"解析失敗: {e}")
             
             st.divider()
-            if st.button("⚠️ 清空資料庫"):
-                with conn.session as s:
-                    s.execute(text("DELETE FROM financials"))
-                    s.commit()
-                st.rerun()
+            if st.button("⚠️ 清空資料庫 (重新建表)"):
+                try:
+                    with conn.session as s:
+                        s.execute(text("DELETE FROM financials"))
+                        s.commit()
+                    st.warning("已清空所有資料")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"清空失敗：{e}")
 
         st.info("提示：此處可直接編輯，記得點擊下方儲存按鈕。")
         edited = st.data_editor(
