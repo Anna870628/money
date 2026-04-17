@@ -33,7 +33,6 @@ if check_password():
     conn = st.connection("postgresql", type="sql")
 
     def load_data():
-        """讀取雲端資料，若無資料則回傳空架構"""
         try:
             df = conn.query("SELECT * FROM financials", ttl="0")
             months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
@@ -45,21 +44,15 @@ if check_password():
             return pd.DataFrame(columns=['專案說明', '紀錄類型', '營收分類', '顏色標記', '說明'] + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
 
     def save_to_supabase(df):
-        """極速寫入引擎：使用 DELETE 避開死結，讓 Pandas 自動完美建表"""
         try:
             with conn.session as session:
-                # 只清空舊資料列，不刪除表格結構
                 session.execute(text("DELETE FROM financials"))
                 session.commit()
         except Exception:
-            pass # 如果表格還不存在，會直接跳過
-            
-        # 使用 append 模式：若表格不存在，Pandas 會自動依照 DF 建立完整的 17 個欄位
-        # chunksize=100 避免單次參數過多，method='multi' 確保批次寫入極速
+            pass 
         df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=100, method='multi')
 
     def process_imported_file(uploaded_file):
-        """讀取 Excel、辨識顏色、清洗數據"""
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet_names = wb.sheetnames
         target_s = sheet_names[0]
@@ -105,7 +98,8 @@ if check_password():
     # ==========================================
     st.title("📊 車聯網事業本部 - 專案營收戰情室")
     
-    tabs = st.tabs(["🎴 專案卡片摘要", "📝 原始數據管理", "🎨 顏色加總分析"])
+    # 這裡修改了第三個 Tab 的名字
+    tabs = st.tabs(["🎴 專案卡片摘要", "📝 原始數據管理", "📈 分類加總分析"])
     data = load_data()
 
     # --- TAB 1: 卡片戰情室 ---
@@ -137,7 +131,6 @@ if check_password():
                         
                         reach = (est_in / target) if target != 0 else 0
                         st.write(f"**目標達成率: {reach:.1%}**")
-                        # 確保數值在 0 到 1 之間，避免因為負數營收導致 Streamlit 當機
                         st.progress(min(max(reach, 0.0), 1.0))  
                         with st.expander("查看 1-12 月數據"):
                             st.dataframe(p_df, use_container_width=True)
@@ -179,16 +172,29 @@ if check_password():
             save_to_supabase(edited)
             st.success("已更新至雲端！")
 
-    # --- TAB 3: 顏色加總 ---
+    # --- TAB 3: 分類加總分析 ---
     with tabs[2]:
         if not data.empty:
             df_sum = data.copy()
             months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
             df_sum['年度總計'] = df_sum[months].sum(axis=1)
             
-            st.subheader("📊 依 Excel 底色加總營收規模")
-            color_res = df_sum.groupby(['顏色標記', '紀錄類型'])['年度總計'].sum().unstack().fillna(0)
-            st.dataframe(color_res.style.format("{:,.0f}"), use_container_width=True)
+            st.subheader("📊 依「營收分類」加總營收與毛利")
+            
+            # 改為使用 營收分類 來做 GroupBy
+            cat_res = df_sum.groupby(['營收分類', '紀錄類型'])['年度總計'].sum().unstack().fillna(0)
+            
+            # 自動計算毛利與毛利率
+            if '收入預估' in cat_res.columns and '支出預估' in cat_res.columns:
+                cat_res['預估毛利'] = cat_res['收入預估'] - cat_res['支出預估']
+                cat_res['毛利率'] = (cat_res['預估毛利'] / cat_res['收入預估']).replace([float('inf'), -float('inf')], 0).fillna(0)
+                
+            # 設定格式
+            format_dict = {col: "{:,.0f}" for col in cat_res.columns if col != '毛利率'}
+            if '毛利率' in cat_res.columns:
+                format_dict['毛利率'] = "{:.2%}"
+                
+            st.dataframe(cat_res.style.format(format_dict), use_container_width=True)
             
             st.divider()
             st.subheader("🔍 異常明細 (目標 ≠ 預估)")
@@ -198,5 +204,9 @@ if check_password():
                 t = pdf[pdf['紀錄類型'] == '收入']['年度總計'].sum()
                 e = pdf[pdf['紀錄類型'] == '收入預估']['年度總計'].sum()
                 if t != e:
-                    diff_list.append({"專案": p, "分類": pdf['營收分類'].iloc[0], "目標": t, "預估": e, "差異": t-e})
-            if diff_list: st.table(pd.DataFrame(diff_list))
+                    cat_name = pdf['營收分類'].iloc[0] if not pdf['營收分類'].empty else "未分類"
+                    diff_list.append({"專案": p, "分類": cat_name, "目標": t, "預估": e, "差異": t-e})
+            if diff_list: 
+                st.table(pd.DataFrame(diff_list))
+            else:
+                st.success("✅ 目前所有專案目標與預估皆一致。")
