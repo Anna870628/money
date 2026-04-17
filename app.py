@@ -20,9 +20,12 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v9.3", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v11", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
+    # ==========================================
+    # 1. 核心邏輯區
+    # ==========================================
     def load_data():
         try:
             df = conn.query("SELECT * FROM financials", ttl="0")
@@ -38,10 +41,10 @@ if check_password():
         with conn.session as session:
             session.execute(text("DELETE FROM financials"))
             session.commit()
-        df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=100, method='multi')
+        df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=50, method='multi')
 
     def process_imported_file(uploaded_file):
-        """讀取 Excel 並精準抓取儲存格背景底色 (Fill Color)"""
+        """強化版顏色讀取：能安全解析 Excel 的佈景主題色 (Theme) 與 RGB"""
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet_names = wb.sheetnames
         target_s = sheet_names[0]
@@ -52,27 +55,29 @@ if check_password():
         sheet = wb[target_s]
         
         color_list = []
-        # 從第 4 行開始 (對應 skiprows=2)
         for row in sheet.iter_rows(min_row=4):
-            # 優先抓取「紀錄類型」(row[2]) 的底色
-            target_cell = row[2] 
-            fill = target_cell.fill
             color_hex = "無底色"
-            
-            if fill and fill.start_color:
-                rgb = str(fill.start_color.rgb)
-                # openpyxl 的 RGB 可能帶 Alpha (如 FFD9D9D9)，我們取最後 6 碼
-                if len(rgb) >= 6:
-                    color_hex = rgb[-6:].upper()
-            
-            # 若紀錄類型沒顏色，再看專案說明 (row[1])
-            if color_hex == "000000" or color_hex == "無底色":
-                fill_alt = row[1].fill
-                if fill_alt and fill_alt.start_color:
-                    rgb_alt = str(fill_alt.start_color.rgb)
-                    if len(rgb_alt) >= 6:
-                        color_hex = rgb_alt[-6:].upper()
-            
+            # 優先掃描專案說明與紀錄類型欄位
+            for cell in [row[1], row[2]]: 
+                fill = cell.fill
+                if fill and fill.start_color:
+                    c_type = getattr(fill.start_color, 'type', None)
+                    # 如果是 Excel 佈景主題色
+                    if c_type == 'theme':
+                        color_hex = f"主題色代碼_{fill.start_color.theme}"
+                        break
+                    # 如果是標準 RGB
+                    elif c_type == 'rgb' and fill.start_color.rgb:
+                        val = str(fill.start_color.rgb)[-6:].upper()
+                        if val != '000000':
+                            color_hex = f"色碼_{val}"
+                            break
+                    # 如果遇到奇怪物件 (像你看到的 STR>)，強制轉字串擷取
+                    else:
+                        raw_str = str(getattr(fill.start_color, 'rgb', ''))
+                        if raw_str and raw_str != '00000000':
+                            color_hex = f"特殊格式_{raw_str[-6:]}"
+                            break
             color_list.append(color_hex)
 
         uploaded_file.seek(0)
@@ -83,7 +88,6 @@ if check_password():
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
         df['專案說明'] = df['專案說明'].replace(r'^\s*$', pd.NA, regex=True).ffill()
         
-        # 營收分類與數值處理
         cat_col = [c for c in df.columns if '營收分類' in str(c)]
         if cat_col:
             df.rename(columns={cat_col[0]: '營收分類'}, inplace=True)
@@ -112,12 +116,12 @@ if check_password():
         with st.sidebar:
             st.header("📂 匯入數據")
             f = st.file_uploader("選擇 Excel", type=["xlsx"])
-            if f and st.button("🚀 開始解析底色並上傳"):
-                with st.spinner("正在讀取 Excel 背景色..."):
+            if f and st.button("🚀 開始解析並上傳"):
+                with st.spinner("正在解析顏色與數據..."):
                     try:
                         new_df = process_imported_file(f)
                         save_to_supabase(new_df)
-                        st.success("匯入成功！已鎖定底色邏輯。")
+                        st.success("匯入成功！請點擊『營收分類總表』綁定顏色。")
                         st.rerun()
                     except Exception as e:
                         st.error(f"解析失敗: {e}")
@@ -132,7 +136,7 @@ if check_password():
         edited = st.data_editor(data, num_rows="dynamic", use_container_width=True, height=500)
         if st.button("💾 儲存變更", type="primary"):
             save_to_supabase(edited)
-            st.success("雲端已更新！")
+            st.success("已更新至雲端！")
 
     with tabs[2]:
         if not data.empty:
@@ -140,22 +144,39 @@ if check_password():
             months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
             df_sum['年度總計'] = df_sum[months].sum(axis=1)
             
-            # --- 財務邏輯運算 ---
-            # 定義：原目標收入 (底色 D9D9D9 且 包含 '收入' 且不含 '預估')
-            is_target_color = df_sum['顏色標記'].str.contains('D9D9D9', case=False, na=False)
-            is_est_color = df_sum['顏色標記'].str.contains('F2DCDB', case=False, na=False)
+            st.subheader("📋 營收分類戰情總表 (動態底色對應)")
             
-            is_income_text = df_sum['紀錄類型'].str.contains('收入', na=False)
-            is_est_text = df_sum['紀錄類型'].str.contains('預估', na=False)
-            is_expense_text = df_sum['紀錄類型'].str.contains('支出', na=False)
+            # --- 🚀 全新功能：讓使用者自己在 UI 上選擇顏色對應 ---
+            unique_colors = df_sum['顏色標記'].dropna().unique().tolist()
+            if "無底色" not in unique_colors:
+                unique_colors.insert(0, "無底色")
+                
+            st.info("💡 系統已自動抓取 Excel 中的底色標籤，請在下方指定對應關係：")
+            col1, col2 = st.columns(2)
+            with col1:
+                target_color_setting = st.selectbox("🎯 哪一個是『原目標收入』的底色？", unique_colors, index=0)
+            with col2:
+                est_color_setting = st.selectbox("🔮 哪一個是『預估收入』的底色？", unique_colors, index=0)
+
+            st.divider()
+
+            # --- 模糊邏輯運算 (結合剛剛選定的顏色) ---
+            is_income = df_sum['紀錄類型'].str.contains('收入', na=False) & ~df_sum['紀錄類型'].str.contains('預估', na=False)
+            is_est_income = df_sum['紀錄類型'].str.contains('收入', na=False) & df_sum['紀錄類型'].str.contains('預估', na=False)
+            is_exp = df_sum['紀錄類型'].str.contains('支出', na=False) & ~df_sum['紀錄類型'].str.contains('預估', na=False)
+            is_est_exp = df_sum['紀錄類型'].str.contains('支出', na=False) & df_sum['紀錄類型'].str.contains('預估', na=False)
+
+            # 使用使用者在下拉選單選擇的顏色進行過濾
+            is_target_color = df_sum['顏色標記'] == target_color_setting
+            is_est_color = df_sum['顏色標記'] == est_color_setting
 
             # 1. 原目標收入
-            target_rev = df_sum[is_target_color & is_income_text & ~is_est_text].groupby('營收分類')['年度總計'].sum()
+            target_rev = df_sum[is_target_color & is_income].groupby('營收分類')['年度總計'].sum()
             # 2. 預估收入
-            est_rev = df_sum[is_est_color & is_income_text & is_est_text].groupby('營收分類')['年度總計'].sum()
-            # 支出 (用於計算毛利)
-            actual_exp = df_sum[is_expense_text & ~is_est_text].groupby('營收分類')['年度總計'].sum()
-            est_exp = df_sum[is_expense_text & is_est_text].groupby('營收分類')['年度總計'].sum()
+            est_rev = df_sum[is_est_color & is_est_income].groupby('營收分類')['年度總計'].sum()
+            # 3 & 4. 支出數據 (計算毛利用)
+            actual_exp = df_sum[is_exp].groupby('營收分類')['年度總計'].sum()
+            est_exp = df_sum[is_est_exp].groupby('營收分類')['年度總計'].sum()
 
             summary = pd.DataFrame({
                 '原目標收入': target_rev,
@@ -164,19 +185,14 @@ if check_password():
                 '預估支出': est_exp
             }).fillna(0)
 
-            # 3. 原毛利 = 原目標收入 - 實際支出
+            # 計算公式
             summary['原毛利'] = summary['原目標收入'] - summary['實際支出']
-            # 4. 預估毛利 = 預估收入 - 預估支出
             summary['預估毛利'] = summary['預估收入'] - summary['預估支出']
-            # 5. 差異 = 預估收入 - 原目標收入
             summary['差異'] = summary['預估收入'] - summary['原目標收入']
-            # 6. 毛利率 = 預估毛利 / 預估收入
             summary['毛利率'] = (summary['預估毛利'] / summary['預估收入']).replace([float('inf'), -float('inf')], 0).fillna(0)
 
-            # 只顯示要求的欄位
             display_cols = ['原目標收入', '預估收入', '原毛利', '預估毛利', '差異', '毛利率']
             
-            st.subheader("📋 營收分類戰情總表")
             st.dataframe(
                 summary[display_cols].style.format({
                     '原目標收入': '{:,.0f}', '預估收入': '{:,.0f}', 
@@ -185,7 +201,6 @@ if check_password():
                 }).map(lambda x: 'color: red' if isinstance(x, (int, float)) and x < 0 else '', subset=['差異', '預估毛利']),
                 use_container_width=True
             )
-
-            # 診斷工具 (幫助確認色碼是否正確)
-            with st.expander("🔍 診斷：系統偵測到的底色代碼統計"):
-                st.write(df_sum.groupby(['顏色標記', '紀錄類型']).size())
+            
+            with st.expander("🔍 數據診斷器 (查看資料庫原始標籤)"):
+                st.write(df_sum.groupby(['顏色標記', '紀錄類型']).size().reset_index(name='筆數'))
