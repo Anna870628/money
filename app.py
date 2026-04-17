@@ -20,7 +20,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收系統 v9.1", layout="wide")
+    st.set_page_config(page_title="車聯網營收系統 v9.2", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     def load_data():
@@ -41,7 +41,6 @@ if check_password():
         df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=100, method='multi')
 
     def process_imported_file(uploaded_file):
-        """讀取 Excel、辨識顏色、清洗數據"""
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet_names = wb.sheetnames
         target_s = sheet_names[0]
@@ -53,12 +52,17 @@ if check_password():
         
         color_list = []
         for row in sheet.iter_rows(min_row=4):
-            fill = row[1].fill
             color_rgb = "無底色"
-            if fill and fill.start_color and fill.start_color.rgb:
-                rgb_val = str(fill.start_color.rgb)
-                color_rgb = rgb_val[-6:] if len(rgb_val) >= 6 else rgb_val
-            color_list.append(color_rgb.upper())
+            # 【優化1】同時檢查「專案說明(row[1])」和「紀錄類型(row[2])」有沒有塗顏色
+            for cell in [row[1], row[2]]: 
+                fill = cell.fill
+                if fill and fill.start_color and fill.start_color.rgb:
+                    rgb_val = str(fill.start_color.rgb)
+                    val = rgb_val[-6:].upper()
+                    if val != '000000': # 排除預設黑/透明
+                        color_rgb = val
+                        break
+            color_list.append(color_rgb)
 
         uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, sheet_name=target_s, skiprows=2)
@@ -76,6 +80,9 @@ if check_password():
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         for m in months:
             if m in df.columns:
+                # 【優化2】移除千分位逗號，確保數字能被正確轉換
+                if df[m].dtype == object:
+                    df[m] = df[m].astype(str).str.replace(',', '')
                 df[m] = pd.to_numeric(df[m], errors='coerce').fillna(0)
             else:
                 df[m] = 0.0
@@ -89,7 +96,6 @@ if check_password():
     # 2. 介面呈現
     # ==========================================
     st.title("📊 車聯網事業本部 - 專案營收戰情室")
-    
     tabs = st.tabs(["🎴 專案卡片摘要", "📝 原始數據管理", "📈 營收分類總表"])
     data = load_data()
 
@@ -113,13 +119,7 @@ if check_password():
                     s.commit()
                 st.rerun()
 
-        edited = st.data_editor(
-            data, num_rows="dynamic", use_container_width=True, height=500,
-            column_config={
-                "營收分類": st.column_config.SelectboxColumn(options=["24DCM開發/維運", "TOYOTA聯網服務", "LEXUS聯網服務", "其他"]),
-                "紀錄類型": st.column_config.SelectboxColumn(options=["收入", "收入預估", "支出", "支出預估", "收入差異", "支出差異"])
-            }
-        )
+        edited = st.data_editor(data, num_rows="dynamic", use_container_width=True, height=500)
         if st.button("💾 儲存變更", type="primary"):
             save_to_supabase(edited)
             st.success("已更新至雲端！")
@@ -130,25 +130,42 @@ if check_password():
             months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
             df_sum['年度總計'] = df_sum[months].sum(axis=1)
             
+            # 【優化3】透視鏡診斷工具
+            with st.expander("🛠️ 抓不到資料？點此展開診斷 (檢查 Excel 實際讀到的色碼與文字)"):
+                st.markdown("如果下方表格都是 0，請對照以下系統實際抓到的 **色碼** 與 **文字**，看是否與你設定的 `D9D9D9` 及 `收入` 有落差。")
+                debug_df = df_sum.groupby(['顏色標記', '紀錄類型']).size().reset_index(name='資料筆數')
+                st.dataframe(debug_df, use_container_width=True)
+
             st.subheader("📋 營收分類總表")
             
-            # --- 核心邏輯計算 ---
+            # --- 核心邏輯計算 (加入模糊比對) ---
             
-            # 1. 原目標收入 (已修正錯字：營收分類)
+            # 將紀錄類型轉為字串，方便進行模糊搜尋 (包含 '收入' 且不含 '預估')
+            is_income = df_sum['紀錄類型'].astype(str).str.contains('收入', na=False) & \
+                        (~df_sum['紀錄類型'].astype(str).str.contains('預估', na=False))
+            
+            # 包含 '收入' 且包含 '預估'
+            is_est_income = df_sum['紀錄類型'].astype(str).str.contains('收入', na=False) & \
+                            df_sum['紀錄類型'].astype(str).str.contains('預估', na=False)
+
+            # 1. 原目標收入：底色包含 D9D9D9 且 類型為收入
             target_rev = df_sum[
-                (df_sum['顏色標記'] == 'D9D9D9') & 
-                ((df_sum['紀錄類型'] == '收入') | (df_sum['專案說明'] == '收入'))
+                (df_sum['顏色標記'].str.contains('D9D9D9', case=False, na=False)) & is_income
             ].groupby('營收分類')['年度總計'].sum()
 
-            # 2. 預估收入
+            # 2. 預估收入：底色包含 F2DCDB 且 類型為預估收入
             est_rev = df_sum[
-                (df_sum['顏色標記'] == 'F2DCDB') & 
-                ((df_sum['紀錄類型'] == '收入預估') | (df_sum['專案說明'] == '收入預估'))
+                (df_sum['顏色標記'].str.contains('F2DCDB', case=False, na=False)) & is_est_income
             ].groupby('營收分類')['年度總計'].sum()
 
-            # 支出數據
-            actual_exp = df_sum[df_sum['紀錄類型'] == '支出'].groupby('營收分類')['年度總計'].sum()
-            est_exp = df_sum[df_sum['紀錄類型'] == '支出預估'].groupby('營收分類')['年度總計'].sum()
+            # 支出數據 (模糊比對 '支出')
+            is_exp = df_sum['紀錄類型'].astype(str).str.contains('支出', na=False) & \
+                     (~df_sum['紀錄類型'].astype(str).str.contains('預估', na=False))
+            is_est_exp = df_sum['紀錄類型'].astype(str).str.contains('支出', na=False) & \
+                         df_sum['紀錄類型'].astype(str).str.contains('預估', na=False)
+
+            actual_exp = df_sum[is_exp].groupby('營收分類')['年度總計'].sum()
+            est_exp = df_sum[is_est_exp].groupby('營收分類')['年度總計'].sum()
 
             # 合併成最終表
             final_summary = pd.DataFrame({
