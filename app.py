@@ -20,7 +20,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v17", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v18", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
@@ -71,6 +71,16 @@ if check_password():
                     elif getattr(sc, 'type', None) == 'indexed':
                         color_id = f"索引色_{getattr(sc, 'indexed', '未知')}"
                         break
+                    else:
+                        try:
+                            raw = str(getattr(sc, 'rgb', '無RGB資料'))
+                            if raw != '00000000' and raw != '無RGB資料':
+                                safe_raw = "".join(char for char in raw if char.isalnum())
+                                color_id = f"特殊格式_{safe_raw[-6:]}"
+                                break
+                        except:
+                            color_id = "無法解析的特殊顏色"
+                            break
             color_list.append(color_id)
 
         uploaded_file.seek(0)
@@ -95,7 +105,6 @@ if check_password():
         else:
             df['營收分類'] = "其他"
         
-        # --- 處理數字 ---
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         for m in months:
             if m in df.columns:
@@ -105,7 +114,7 @@ if check_password():
             else:
                 df[m] = 0.0
 
-        # --- 🚀 孤兒數字救援引擎 (加回來了！) ---
+        # --- 🚀 孤兒數字救援引擎 ---
         fallback_cols = [c for c in df.columns if any(k in str(c) for k in ['小計', '總計', '合計', '實績'])]
         df['temp_sum'] = df[months].sum(axis=1)
         for idx, row in df.iterrows():
@@ -133,6 +142,54 @@ if check_password():
     tabs = st.tabs(["🎴 專案卡片摘要", "📝 原始數據管理", "📈 營收分類總表"])
     data = load_data()
 
+    # --- 🚀 TAB 1: 專案卡片摘要 (滿血回歸！) ---
+    with tabs[0]:
+        if data.empty:
+            st.warning("請先至『原始數據管理』分頁匯入資料。")
+        else:
+            st.subheader("💡 專案績效一覽表")
+            cats = ["全部分類"] + list(data['營收分類'].unique())
+            sel_cat = st.selectbox("篩選營收分類", cats, key="card_filter")
+            
+            display_data = data if sel_cat == "全部分類" else data[data['營收分類'] == sel_cat]
+            projects = display_data['專案說明'].unique()
+            
+            cols = st.columns(2)
+            for idx, proj in enumerate(projects):
+                with cols[idx % 2]:
+                    p_df = display_data[display_data['專案說明'] == proj]
+                    months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+                    
+                    # 卡片預設邏輯：收入不含預估 = 目標，包含預估 = 預估
+                    is_inc_pure = p_df['紀錄類型'].str.contains('收入', na=False) & ~p_df['紀錄類型'].str.contains('預估', na=False)
+                    is_inc_est = p_df['紀錄類型'].str.contains('收入', na=False) & p_df['紀錄類型'].str.contains('預估', na=False)
+                    is_exp_est = p_df['紀錄類型'].str.contains('支出', na=False) & p_df['紀錄類型'].str.contains('預估', na=False)
+                    
+                    target = p_df[is_inc_pure][months].sum().sum()
+                    est_in = p_df[is_inc_est][months].sum().sum()
+                    est_out = p_df[is_exp_est][months].sum().sum()
+                    
+                    profit = est_in - est_out
+                    margin = (profit / est_in) if est_in != 0 else 0
+                    
+                    with st.container(border=True):
+                        st.markdown(f"#### {proj}")
+                        cat_name = p_df['營收分類'].iloc[0] if not p_df['營收分類'].empty else '未知'
+                        st.caption(f"營收分類：{cat_name}")
+                        
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("目標營收", f"${target:,.0f}")
+                        m2.metric("預估營收", f"${est_in:,.0f}", f"{est_in-target:,.0f}")
+                        m3.metric("預估毛利率", f"{margin:.1%}")
+                        
+                        reach = (est_in / target) if target != 0 else 0
+                        st.write(f"**目標達成率: {reach:.1%}**")
+                        st.progress(min(max(reach, 0.0), 1.0))
+                        
+                        with st.expander("查看 1-12 月數據"):
+                            st.dataframe(p_df, use_container_width=True)
+
+    # --- TAB 2: 原始數據管理 ---
     with tabs[1]:
         with st.sidebar:
             st.header("📂 匯入數據")
@@ -159,6 +216,7 @@ if check_password():
             save_to_supabase(edited)
             st.success("雲端已更新！")
 
+    # --- TAB 3: 營收分類總表 ---
     with tabs[2]:
         if not data.empty:
             df_sum = data.copy()
@@ -167,7 +225,6 @@ if check_password():
             
             st.subheader("📋 營收分類戰情總表")
             
-            # 抓取所有唯一的分類，並強制作為表格的基底，避免任何分類消失
             unique_cats = df_sum['營收分類'].unique().tolist()
             st.caption(f"系統目前偵測到的分類標籤：{', '.join(unique_cats)}")
 
@@ -191,7 +248,7 @@ if check_password():
             is_exp_pure = df_sum['紀錄類型'].str.contains('支出', na=False) & ~df_sum['紀錄類型'].str.contains(est_key, na=False)
             is_exp_est = df_sum['紀錄類型'].str.contains('支出', na=False) & df_sum['紀錄類型'].str.contains(est_key, na=False)
 
-            # --- 🚀 強制打樁：無論篩選結果為何，保證所有分類皆會顯示 ---
+            # --- 🚀 強制打樁：將分類轉換成實體欄位，絕不消失 ---
             summary = pd.DataFrame(index=unique_cats)
             
             summary['原目標收入'] = df_sum[(df_sum['顏色標記'] == target_color) & is_income_pure].groupby('營收分類')['年度總計'].sum()
@@ -201,18 +258,22 @@ if check_password():
             
             summary = summary.fillna(0)
 
-            # 公式計算
             summary['原毛利'] = summary['原目標收入'] - summary['實際支出']
             summary['預估毛利'] = summary['預估收入'] - summary['預估支出']
             summary['差異'] = summary['預估收入'] - summary['原目標收入']
             summary['毛利率'] = (summary['預估毛利'] / summary['預估收入']).replace([float('inf'), -float('inf')], 0).fillna(0)
 
-            display_cols = ['原目標收入', '預估收入', '原毛利', '預估毛利', '差異', '毛利率']
+            # 將索引轉為真實的欄位，確保使用者 100% 看到它
+            summary = summary.reset_index().rename(columns={'index': '營收分類'})
+            
+            display_cols = ['營收分類', '原目標收入', '預估收入', '原毛利', '預估毛利', '差異', '毛利率']
+            
             st.dataframe(
                 summary[display_cols].style.format({
                     '原目標收入': '{:,.0f}', '預估收入': '{:,.0f}', 
                     '原毛利': '{:,.0f}', '預估毛利': '{:,.0f}', 
                     '差異': '{:,.0f}', '毛利率': '{:.2%}'
                 }).map(lambda x: 'color: red' if isinstance(x, (int, float)) and x < 0 else '', subset=['差異', '預估毛利']),
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
