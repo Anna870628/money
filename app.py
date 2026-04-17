@@ -1,151 +1,113 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+from sqlalchemy import text
 
-# --- 1. 初始化 PostgreSQL 連線 ---
-# Streamlit 會自動讀取 Secrets 裡的 [connections.postgresql]
+# 頁面設定
+st.set_page_config(page_title="營收管理系統", layout="wide")
+
+# 建立資料庫連線
 conn = st.connection("postgresql", type="sql")
 
-st.set_page_config(layout="wide", page_title="車聯網營收整理系統")
-
-# --- 2. 資料處理函數 ---
+# --- 共用函數 ---
 def fetch_data():
-    # ttl=0 確保手動更新後能立即看到結果
-    return conn.query('SELECT * FROM financials', ttl=0)
+    return conn.query("SELECT * FROM financials", ttl=0)
 
-def upload_to_db(df):
-    # 移除自動生成的系統欄位再寫入
-    df_to_save = df.drop(columns=['id', '建立時間'], errors='ignore')
-    with conn.session as session:
-        # 先清空舊資料再寫入新資料（批次更新邏輯）
-        session.execute("DELETE FROM financials")
-        df_to_save.to_sql(
-            "financials", 
-            con=conn.engine, 
-            if_exists="append", 
-            index=False,
-            method="multi"
-        )
-        session.commit()
+def calculate_row_total(df):
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return df[months].sum(axis=1)
 
-# --- 3. 側邊欄：Excel 解析邏輯 ---
-with st.sidebar:
-    st.title("📂 數據上傳")
-    uploaded_file = st.file_uploader("匯入 2026 專案收支 Excel", type=["xlsx"])
-    
-    if uploaded_file:
-        if st.button("🚀 執行解析並更新資料庫"):
-            # 讀取 Excel
-            raw_df = pd.read_excel(uploaded_file, header=None)
-            total_cols = raw_df.shape[1]
-            records = []
-            
-            # 每 6 列為一組專案，從第 3 列 (index 2) 開始
-            for i in range(2, len(raw_df), 6):
-                # 專案說明在 index 1
-                proj_name = raw_df.iloc[i, 1] if total_cols > 1 and pd.notna(raw_df.iloc[i, 1]) else None
-                if not proj_name: continue
+# --- 主選單 ---
+tabs = st.tabs(["1. 各專案推進營收", "2. 數據管理庫", "3. 營收分類彙整表"])
 
-                # 營收分類在 index 19，說明在 index 20
-                cat = raw_df.iloc[i, 19] if total_cols > 19 and pd.notna(raw_df.iloc[i, 19]) else "未分類"
-                desc = raw_df.iloc[i, 20] if total_cols > 20 and pd.notna(raw_df.iloc[i, 20]) else ""
-
-                # 固定六列標籤
-                row_labels = ["收入", "收入預估", "支出", "支出預估", "收入差異", "支出差異"]
-                
-                for idx, label in enumerate(row_labels):
-                    if i + idx < len(raw_df):
-                        # 月份數據在 index 3~14 (D到O欄)
-                        m_vals = raw_df.iloc[i + idx, 3:15].fillna(0).replace('-', 0).astype(float).tolist()
-                        
-                        # 確保月份數據長度正確
-                        while len(m_vals) < 12: m_vals.append(0.0)
-                        
-                        records.append({
-                            "專案說明": proj_name,
-                            "Jan": m_vals[0], "Feb": m_vals[1], "Mar": m_vals[2], 
-                            "Apr": m_vals[3], "May": m_vals[4], "Jun": m_vals[5],
-                            "Jul": m_vals[6], "Aug": m_vals[7], "Sep": m_vals[8], 
-                            "Oct": m_vals[9], "Nov": m_vals[10], "Dec": m_vals[11],
-                            "營收分類": cat,
-                            "紀錄類型": label,
-                            "說明": desc
-                        })
-            
-            if records:
-                upload_to_db(pd.DataFrame(records))
-                st.success("✅ 資料庫更新成功！")
-                st.rerun()
-
-# --- 4. 主分頁 UI 邏輯 ---
-tab1, tab2, tab3 = st.tabs(["📊 各專案推進營收", "🛠️ 資料庫管理", "📈 營收分類彙整表"])
-
-df = fetch_data()
-months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-if not df.empty:
-    df['年度小計'] = df[months].sum(axis=1)
-
-    with tab1:
-        st.subheader("各專案進度卡片")
+# --- Tab 1: 各專案推進營收 (卡片呈現) ---
+with tabs[0]:
+    st.header("📈 專案營收推進看板")
+    df = fetch_data()
+    if not df.empty:
+        df['年度總額'] = calculate_row_total(df)
         projects = df['專案說明'].unique()
-        cols = st.columns(3)
-        for idx, p in enumerate(projects):
-            p_df = df[df['專案說明'] == p]
-            
-            target_rev = p_df[p_df['紀錄類型'] == "收入"]['年度小計'].sum()
-            est_rev = p_df[p_df['紀錄類型'] == "收入預估"]['年度小計'].sum()
-            
-            # 修正先前的打字錯誤
-            category = p_df['營收分類'].iloc[0] if '營收分類' in p_df.columns else "未分類"
-            
-            rate = (est_rev / target_rev * 100) if target_rev != 0 else 0
-            
-            with cols[idx % 3]:
-                st.markdown(f"""
-                <div style="padding:15px; border-radius:10px; border:1px solid #eee; margin-bottom:15px; background-color: #fcfcfc;">
-                    <small style="color:gray;">{category}</small>
-                    <h4 style="margin:5px 0;">{p}</h4>
-                    <p style="margin:2px; font-size:13px;">目標營收：{target_rev:,.0f}</p>
-                    <p style="margin:2px; font-size:13px;">預估收入：{est_rev:,.0f}</p>
-                    <h3 style="color:{'#d32f2f' if rate < 100 else '#2e7d32'}; margin-top:8px;">{rate:.1f}% <small style="font-size:12px;">推進率</small></h3>
-                </div>
-                """, unsafe_allow_html=True)
-
-    with tab2:
-        st.subheader("手動更新與批次管理")
-        edited_df = st.data_editor(
-            df, 
-            num_rows="dynamic", 
-            key="db_editor",
-            column_config={"id": None, "建立時間": None}
-        )
         
-        if st.button("💾 儲存所有變更"):
-            upload_to_db(edited_df)
-            st.success("變更已同步至資料庫")
+        cols = st.columns(3)
+        for i, project in enumerate(projects):
+            with cols[i % 3]:
+                p_data = df[df['專案說明'] == project]
+                target_rev = p_data[p_data['紀錄類型'] == '收入']['年度總額'].sum()
+                est_rev = p_data[p_data['紀錄類型'] == '收入預估']['年度總額'].sum()
+                prog_rate = (est_rev / target_rev * 100) if target_rev != 0 else 0
+                cat = p_data['營收分類'].iloc[0]
+                
+                with st.container(border=True):
+                    st.subheader(f"{project}")
+                    st.caption(f"分類: {cat}")
+                    st.metric("目標營收 (收入)", f"${target_rev:,.0f}")
+                    st.metric("預估收入", f"${est_rev:,.0f}", f"{prog_rate:.1f}% 推進率")
+                    st.progress(min(prog_rate/100, 1.0))
+    else:
+        st.info("目前無資料，請先至分頁 2 匯入 Excel")
+
+# --- Tab 2: 數據管理庫 (匯入與刪除) ---
+with tabs[1]:
+    st.header("🗄️ 資料庫維護")
+    
+    # Excel 匯入區
+    uploaded_file = st.file_uploader("匯入營收 Excel (需符合格式)", type=["xlsx"])
+    if uploaded_file:
+        new_df = pd.read_excel(uploaded_file)
+        if st.button("確認寫入資料庫"):
+            with conn.session as session:
+                for _, row in new_df.iterrows():
+                    # 這裡根據你提供的 SQL 欄位寫入
+                    insert_sql = text("""
+                        INSERT INTO financials ("專案說明", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "營收分類", "紀錄類型", "說明")
+                        VALUES (:p, :m1, :m2, :m3, :m4, :m5, :m6, :m7, :m8, :m9, :m10, :m11, :m12, :cat, :type, :desc)
+                    """)
+                    session.execute(insert_sql, {
+                        "p": row['專案說明'], "m1": row['Jan'], "m2": row['Feb'], "m3": row['Mar'],
+                        "m4": row['Apr'], "m5": row['May'], "m6": row['Jun'], "m7": row['Jul'],
+                        "m8": row['Aug'], "m9": row['Sep'], "m10": row['Oct'], "m11": row['Nov'],
+                        "m12": row['Dec'], "cat": row['營收分類'], "type": row['紀錄類型'], "desc": row['說明']
+                    })
+                session.commit()
+            st.success("資料已匯入！")
             st.rerun()
 
-    with tab3:
-        st.subheader("營收分類彙整報表")
-        # 依分類加總
-        agg = df.groupby(['營收分類', '紀錄類型'])['年度小計'].sum().unstack(fill_value=0)
+    # 資料編輯與批次刪除
+    df_manage = fetch_data()
+    if not df_manage.empty:
+        # 使用 data_editor 進行手動更新
+        edited_df = st.data_editor(df_manage, key="db_editor", num_rows="dynamic", use_container_width=True)
         
-        summary = pd.DataFrame(index=agg.index)
-        summary['目標收入'] = agg.get('收入', 0)
-        summary['預估收入'] = agg.get('收入預估', 0)
-        summary['目標毛利'] = agg.get('收入', 0) - agg.get('支出', 0)
-        summary['預估毛利'] = agg.get('收入預估', 0) - agg.get('支出預估', 0)
-        summary['預估毛利率'] = (summary['預估毛利'] / summary['預估收入']).replace([np.inf, -np.inf], 0).fillna(0)
-        summary['差異(目標-預估)'] = summary['目標收入'] - summary['預估收入']
+        # 標示紅字邏輯 (CSS 模擬)
+        st.markdown("""<style>.red-text { color: red; font-weight: bold; }</style>""", unsafe_allow_width=True)
         
-        st.dataframe(
-            summary.style.format({
-                '目標收入': '{:,.0f}', '預估收入': '{:,.0f}',
-                '目標毛利': '{:,.0f}', '預估毛利': '{:,.0f}',
-                '預估毛利率': '{:.2%}', '差異(目標-預估)': '{:,.0f}'
-            }).applymap(lambda x: 'color: red' if isinstance(x, (int, float)) and x < 0 else '', 
-                       subset=['差異(目標-預估)', '預估毛利'])
-        )
-else:
-    st.info("尚未匯入數據，請利用左側面板上傳 Excel。")
+        selected_ids = st.multiselect("選擇要刪除的 ID", df_manage['id'].tolist())
+        if st.button("🗑️ 執行批次刪除", type="primary"):
+            if selected_ids:
+                with conn.session as session:
+                    session.execute(text("DELETE FROM financials WHERE id IN :ids"), {"ids": tuple(selected_ids)})
+                    session.commit()
+                st.rerun()
+
+# --- Tab 3: 營收分類彙整表 ---
+with tabs[2]:
+    st.header("📊 分類彙整分析")
+    df_all = fetch_data()
+    if not df_all.empty:
+        df_all['年度總額'] = calculate_row_total(df_all)
+        
+        # 建立彙整邏輯
+        summary = df_all.groupby(['營收分類', '紀錄類型'])['年度總額'].sum().unstack(fill_value=0)
+        
+        # 確保所有欄位都存在，避免報錯
+        required_cols = ['收入', '收入預估', '支出', '支出預估']
+        for c in required_cols:
+            if c not in summary.columns: summary[c] = 0
+            
+        summary['目標毛利'] = summary['收入'] - summary['支出']
+        summary['預估毛利'] = summary['收入預估'] - summary['支出預估']
+        summary['預估毛利率'] = (summary['預估毛利'] / summary['收入預估']).apply(lambda x: f"{x:.1%}" if x != 0 else "0%")
+        summary['差異'] = summary['收入'] - summary['收入預估']
+        
+        st.table(summary[['收入', '收入預估', '目標毛利', '預估毛利', '預估毛利率', '差異']])
+    else:
+        st.warning("暫無資料可彙整")
