@@ -1,204 +1,147 @@
 import streamlit as st
 import pandas as pd
+from supabase import create_client, Client
 import numpy as np
-from sqlalchemy import text
-import openpyxl
-import re
 
-# ==========================================
-# 0. 登入與基礎設定
-# ==========================================
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == st.secrets["passwords"]["admin_password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-    if "password_correct" not in st.session_state:
-        st.title("🔒 營收管理系統 - 登入")
-        st.text_input("請輸入密碼", type="password", on_change=password_entered, key="password")
-        return False
-    return st.session_state.get("password_correct", False)
+# --- 1. 初始化 Supabase 連線 ---
+url = st.secrets["SUPABASE_URL"]
+key = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(url, key)
 
-if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v42", layout="wide")
-    conn = st.connection("postgresql", type="sql")
+st.set_page_config(layout="wide", page_title="營收整理系統")
 
-    # ==========================================
-    # 🎯 核心自動對齊規則
-    # ==========================================
-    def apply_business_rules(record_type, color_marker):
-        is_pink = any(k in str(color_marker) for k in ["#F2DCDB", "#FCE4D6", "THEME_PINK", "#FFC7CE", "#FAD0C9", "#F8CBAD"])
-        if any(k in str(record_type) for k in ["收入", "營收", "實績"]):
-            return "🔮 預估收入" if is_pink else "🎯 原目標收入"
-        if any(k in str(record_type) for k in ["支出", "成本"]):
-            return "💸 預估支出" if is_pink else "📉 原目標支出"
-        return "❌ 忽略不計"
+# --- 2. 資料處理函數 ---
+def fetch_data():
+    res = supabase.table("revenue_records").select("*").execute()
+    return pd.DataFrame(res.data)
 
-    # ==========================================
-    # 1. 數據清洗引擎
-    # ==========================================
-    def clean_currency(val):
-        if pd.isna(val) or val == "": return 0.0
-        s = str(val).replace(',', '').strip()
-        if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
-        try: return float(re.sub(r'[^\d\.\-]', '', s))
-        except: return 0.0
+def upload_to_supabase(df):
+    # 先清空舊資料 (依需求決定是否覆蓋)
+    # supabase.table("revenue_records").delete().neq("id", 0).execute()
+    data = df.to_dict(orient="records")
+    supabase.table("revenue_records").insert(data).execute()
 
-    def load_data():
-        try:
-            df = conn.query("SELECT * FROM financials", ttl="0")
-            months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-            for m in months:
-                if m in df.columns:
-                    df[m] = pd.to_numeric(df[m], errors='coerce').fillna(0)
-            return df
-        except:
-            return pd.DataFrame()
+# --- 3. 側邊欄：匯入功能 ---
+with st.sidebar:
+    st.title("營收系統控制")
+    uploaded_file = st.file_uploader("匯入每月收支 Excel", type=["xlsx"])
+    
+    if uploaded_file:
+        if st.button("執行解析並存入 Supabase"):
+            # 根據您的檔案結構解析 (每 6 列一組)
+            raw_df = pd.read_excel(uploaded_file, header=None)
+            all_records = []
+            
+            # 解析邏輯 (假設從第 3 列開始是數據)
+            for i in range(2, len(raw_df), 6):
+                proj_name = raw_df.iloc[i, 1] if pd.notna(raw_df.iloc[i, 1]) else "未命名專案"
+                category = raw_df.iloc[i, 19] if pd.notna(raw_df.iloc[i, 19]) else "未分類"
+                
+                # 六列類型定義
+                row_labels = ["收入", "收入預估", "支出", "支出預估", "收入差異", "支出差異"]
+                
+                for idx, label in enumerate(row_labels):
+                    if i + idx < len(raw_df):
+                        row_vals = raw_df.iloc[i + idx, 3:15].fillna(0).replace('-', 0).astype(float).tolist()
+                        record = {
+                            "project_name": proj_name,
+                            "category": category,
+                            "row_type": label,
+                            "m1": row_vals[0], "m2": row_vals[1], "m3": row_vals[2], "m4": row_vals[3],
+                            "m5": row_vals[4], "m6": row_vals[5], "m7": row_vals[6], "m8": row_vals[7],
+                            "m9": row_vals[8], "m10": row_vals[9], "m11": row_vals[10], "m12": row_vals[11],
+                            "total": sum(row_vals)
+                        }
+                        all_records.append(record)
+            
+            upload_to_supabase(pd.DataFrame(all_records))
+            st.success("資料已成功上傳至 Supabase！")
+            st.rerun()
 
-    def save_to_supabase(df):
-        with conn.session as session:
-            session.execute(text("DROP TABLE IF EXISTS financials"))
-            df.to_sql('financials', conn.engine, if_exists='replace', index=False)
-            session.commit()
+# --- 4. 主分頁 UI ---
+tab1, tab2, tab3 = st.tabs(["📊 各專案推進營收", "🛠️ 資料庫管理", "📈 營收分類彙整表"])
 
-    def process_imported_file(uploaded_file):
-        wb = openpyxl.load_workbook(uploaded_file, data_only=True)
-        sheet = wb[wb.sheetnames[0]]
-        color_list = []
-        for row in sheet.iter_rows(min_row=4):
-            marker = "無底色"
-            for cell in row[1:3]: # 檢查 B, C 欄底色
-                if cell.fill and hasattr(cell.fill, 'start_color') and cell.fill.start_color:
-                    sc = cell.fill.start_color
-                    if sc.type == 'rgb' and sc.rgb and str(sc.rgb) not in ['00000000', '000000']:
-                        marker = f"#{str(sc.rgb)[-6:].upper()}"
-                        break
-                    elif sc.type == 'theme' and sc.theme is not None:
-                        marker = "THEME_PINK" if sc.theme in [4,5,7,9] else "THEME_GREY"
-                        break
-            color_list.append(marker)
+df = fetch_data()
 
-        uploaded_file.seek(0)
-        raw = pd.read_excel(uploaded_file, skiprows=2)
-        raw.columns = [str(c).strip() for c in raw.columns]
+# --- 分頁 1: 各專案推進營收 (卡片呈現) ---
+with tab1:
+    if not df.empty:
+        projects = df['project_name'].unique()
+        cols = st.columns(3)
+        for idx, p in enumerate(projects):
+            p_df = df[df['project_name'] == p]
+            
+            target_inc = p_df[p_df['row_type'] == "收入"]['total'].sum()
+            est_inc = p_df[p_df['row_type'] == "收入預估"]['total'].sum()
+            cat = p_df['category'].iloc[0]
+            rate = (est_inc / target_inc * 100) if target_inc != 0 else 0
+            
+            with cols[idx % 3]:
+                st.markdown(f"""
+                <div style="padding:15px; border-radius:10px; border:1px solid #E0E0E0; background-color:#F8F9FA; margin-bottom:10px">
+                    <small>{cat}</small>
+                    <h3 style="margin:0px">{p}</h3>
+                    <hr>
+                    <p style="margin:2px">目標營收：<b>{target_inc:,.0f}</b></p>
+                    <p style="margin:2px">預估收入：<b>{est_inc:,.0f}</b></p>
+                    <h4 style="color:{'#D32F2F' if rate < 100 else '#388E3C'}">推進率：{rate:.1f}%</h4>
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        st.info("尚未從側邊欄匯入資料。")
+
+# --- 分頁 2: 資料庫管理 ---
+with tab2:
+    if not df.empty:
+        st.subheader("手動更新與批次刪除")
+        # 使用 data_editor 編輯
+        edited_df = st.data_editor(
+            df, 
+            num_rows="dynamic", 
+            key="db_editor",
+            disabled=["id", "created_at"]
+        )
         
-        def find_idx(keywords, default):
-            for i, col in enumerate(raw.columns):
-                if any(k in col for k in keywords): return i
-            return default
+        c1, c2 = st.columns(2)
+        if c1.button("儲存所有更改"):
+            # 這裡簡化處理：全刪除再全寫入，或可撰寫 UPSERT 邏輯
+            supabase.table("revenue_records").delete().neq("id", 0).execute()
+            # 移除自動生成的 id 欄位再寫入
+            save_df = edited_df.drop(columns=['id', 'created_at'], errors='ignore')
+            upload_to_supabase(save_df)
+            st.success("Supabase 資料庫已更新")
+            st.rerun()
+            
+        st.caption("提示：點擊列最左側可選取並按 Delete 鍵刪除。若數值為負，系統將自動在報表中標示紅字。")
 
-        proj_idx = find_idx(["專案"], 1)
-        type_idx = find_idx(["類型", "Unnamed: 2"], 2)
-        cat_idx  = find_idx(["分類"], -1)
-        jan_idx  = find_idx(["Jan"], 3)
-
-        df = pd.DataFrame()
-        df['專案說明'] = raw.iloc[:, proj_idx].replace(r'^\s*$', np.nan, regex=True).ffill()
-        df['紀錄類型'] = raw.iloc[:, type_idx].astype(str).str.strip()
+# --- 分頁 3: 營收分類彙整表 ---
+with tab3:
+    if not df.empty:
+        # 轉換資料結構以利計算
+        agg = df.groupby(['category', 'row_type'])['total'].sum().unstack(fill_value=0)
         
-        if cat_idx != -1 and cat_idx < len(raw.columns):
-            df['營收分類'] = raw.iloc[:, cat_idx].astype(str).str.replace('\n', ' ').str.strip()
-            df['營收分類'] = df['營收分類'].replace(['nan', 'None', '', 'NaN'], np.nan).ffill().fillna("其他")
-        else:
-            df['營收分類'] = "其他"
-
-        df['顏色標記'] = color_list[:len(df)]
-        months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-        for i, m in enumerate(months):
-            c_idx = jan_idx + i
-            df[m] = raw.iloc[:, c_idx].apply(clean_currency) if c_idx < len(raw.columns) else 0.0
-
-        f_inc_idx = find_idx(["收入小計"], -1)
-        f_exp_idx = find_idx(["支出小計"], -1)
-        for idx, row in df.iterrows():
-            if sum(row[months]) == 0:
-                is_inc = any(k in str(row['紀錄類型']) for k in ["收入", "營收", "實績"])
-                if is_inc and f_inc_idx != -1: df.at[idx, 'Jan'] = clean_currency(raw.iloc[idx, f_inc_idx])
-                elif not is_inc and f_exp_idx != -1: df.at[idx, 'Jan'] = clean_currency(raw.iloc[idx, f_exp_idx])
-                            
-        return df.dropna(subset=['紀錄類型'])[['專案說明', '紀錄類型'] + months + ['營收分類', '顏色標記']]
-
-    # ==========================================
-    # 2. 介面呈現 (固定顯示分頁)
-    # ==========================================
-    st.title("📊 專案營收戰情系統")
-    tab_cards, tab_summary, tab_import = st.tabs(["🎴 專案戰情卡片", "📈 分類匯總報表", "📥 數據匯入與編輯"])
-
-    data = load_data()
-
-    # --- 分頁 1 & 2: 只有有資料時才顯示內容 ---
-    with tab_cards:
-        if data.empty:
-            st.info("💡 雲端資料庫目前是空的，請先至『📥 數據匯入與編輯』分頁上傳 Excel。")
-        else:
-            df = data.copy()
-            months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-            df['年度總計'] = df[months].sum(axis=1)
-            df['財務屬性'] = df.apply(lambda row: apply_business_rules(row['紀錄類型'], row['顏色標記']), axis=1)
+        # 確保必要欄位存在
+        for col in ["收入", "收入預估", "支出", "支出預估"]:
+            if col not in agg.columns: agg[col] = 0
             
-            all_cats = ["全部分類"] + list(df['營收分類'].unique())
-            sel_cat = st.selectbox("篩選營收分類", all_cats)
-            display_data = df if sel_cat == "全部分類" else df[df['營收分類'] == sel_cat]
-            
-            cols = st.columns(2)
-            for idx, proj in enumerate(display_data['專案說明'].unique()):
-                with cols[idx % 2]:
-                    p_df = display_data[display_data['專案說明'] == proj]
-                    t_rev = p_df[p_df['財務屬性'] == '🎯 原目標收入']['年度總計'].sum()
-                    e_rev = p_df[p_df['財務屬性'] == '🔮 預估收入']['年度總計'].sum()
-                    e_exp = p_df[p_df['財務屬性'] == '💸 預估支出']['年度總計'].sum()
-                    margin = ((e_rev - e_exp) / e_rev) if e_rev != 0 else 0
-                    reach = (e_rev / t_rev) if t_rev != 0 else 0
-                    
-                    with st.container(border=True):
-                        st.markdown(f"### {proj}")
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("目標營收", f"{t_rev:,.0f}")
-                        m2.metric("預估營收", f"{e_rev:,.0f}", f"{e_rev-t_rev:,.0f}")
-                        m3.metric("預估毛利率", f"{margin:.1%}")
-                        st.write(f"**目標達成率: {reach:.1%}**")
-                        st.progress(min(max(reach, 0.0), 1.0))
+        report = pd.DataFrame(index=agg.index)
+        report['目標收入'] = agg['收入']
+        report['預估收入'] = agg['收入預估']
+        report['目標毛利'] = agg['收入'] - agg['支出']
+        report['預估毛利'] = agg['收入預估'] - agg['支出預估']
+        report['預估毛利率'] = (report['預估毛利'] / report['預估收入']).replace([np.inf, -np.inf], 0).fillna(0)
+        report['差異(目標-預估)'] = report['目標收入'] - report['預估收入']
+        
+        # 樣式設定：負數標紅字
+        def color_negative_red(val):
+            if isinstance(val, (int, float)) and val < 0:
+                return 'color: red'
+            return ''
 
-    with tab_summary:
-        if data.empty:
-            st.info("💡 雲端資料庫目前是空的，請先至『📥 數據匯入與編輯』分頁上傳 Excel。")
-        else:
-            df = data.copy()
-            months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-            df['年度總計'] = df[months].sum(axis=1)
-            df['財務屬性'] = df.apply(lambda row: apply_business_rules(row['紀錄類型'], row['顏色標記']), axis=1)
-            
-            summary = df.groupby(['營收分類', '財務屬性'])['年度總計'].sum().unstack().fillna(0)
-            for c in ['🎯 原目標收入', '🔮 預估收入', '📉 原目標支出', '💸 預估支出']:
-                if c not in summary.columns: summary[c] = 0
-            
-            summary['原毛利'] = summary['🎯 原目標收入'] - summary['📉 原目標支出']
-            summary['預計毛利'] = summary['🔮 預估收入'] - summary['💸 預估支出']
-            summary['差異'] = summary['🎯 原目標收入'] - summary['🔮 預估收入']
-            summary['毛利率'] = (summary['預計毛利'] / summary['🔮 預估收入']).replace([np.inf, -np.inf], 0).fillna(0)
-            st.dataframe(summary[['🎯 原目標收入', '🔮 預估收入', '原毛利', '預計毛利', '差異', '毛利率']].style.format({'毛利率': '{:.2%}', '預估收入': '{:,.0f}'}), use_container_width=True)
-
-    # --- 分頁 3: 永遠顯示匯入功能 ---
-    with tab_import:
-        st.subheader("📥 匯入新資料")
-        st.markdown("---")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            f = st.file_uploader("選擇 Excel", type=["xlsx"], key="file_upload_widget")
-            if f and st.button("🚀 執行自動對齊匯入"):
-                try:
-                    processed_df = process_imported_file(f)
-                    save_to_supabase(processed_df)
-                    st.success("匯入成功！數據已存入雲端資料庫。")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"解析發生錯誤: {e}")
-        with c2:
-            if not data.empty:
-                st.write("📝 **雲端數據即時微調**")
-                edited = st.data_editor(data, num_rows="dynamic", use_container_width=True)
-                if st.button("💾 儲存微調變更"):
-                    save_to_supabase(edited)
-                    st.rerun()
+        st.dataframe(
+            report.style.format({
+                '目標收入': '{:,.0f}', '預估收入': '{:,.0f}',
+                '目標毛利': '{:,.0f}', '預估毛利': '{:,.0f}',
+                '預估毛利率': '{:.2%}', '差異(目標-預估)': '{:,.0f}'
+            }).applymap(color_negative_red)
+        )
