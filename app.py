@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import text
 
-# 1. 頁面配置 (使用系統預設顏色)
+# 1. 頁面配置 (使用系統預設顏色，確保閱讀清晰)
 st.set_page_config(page_title="車聯網專案營收戰情室", layout="wide")
 
 # 建立資料庫連線
@@ -36,7 +36,7 @@ with st.sidebar:
     
     if uploaded_file:
         try:
-            # 自動偵測「專案說明」所在行 (通常是第 3 或 4 行)
+            # 自動偵測標題行
             temp_df = pd.read_excel(uploaded_file, nrows=15)
             header_idx = 0
             for i, row in temp_df.iterrows():
@@ -95,9 +95,9 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 🏠 主畫面：看板與彙整分析
+# 🏠 主畫面內容
 # ==========================================
-st.title("📈 營收管理平台")
+st.title("📊 營收管理平台")
 df = get_db_data()
 
 if df.empty:
@@ -111,55 +111,64 @@ else:
 
     tab1, tab2, tab3 = st.tabs(["🚀 專案推進看板", "📊 營收分類彙整", "📝 原始數據細目"])
 
-    # --- Tab 1: 專案推進看板 (沿用正確邏輯) ---
+    # --- Tab 1: 專案推進看板 (新增差異與展開明細) ---
     with tab1:
         projects = [p for p in df['專案說明'].unique() if p and "序號" not in str(p) and str(p) != 'nan']
-        cols = st.columns(3) # 改回 3 欄
+        cols = st.columns(2) # 改為 2 欄，讓展開的表格更好閱讀
         
         for i, project in enumerate(projects):
             p_data = df[df['專案說明'] == project]
             income_rows = p_data[p_data['紀錄類型'].str.contains('收入', na=False)]
             
-            # 卡片邏輯：第1筆收入是目標(灰底)，第2筆收入是預估(粉底)
+            # 邏輯：第一筆為目標，第二筆為預估
             target_rev = income_rows.iloc[0]['年度總額'] if len(income_rows) > 0 else 0
             est_rev = income_rows.iloc[1]['年度總額'] if len(income_rows) > 1 else target_rev
             
+            # 計算差異 (目標 - 預估)
+            revenue_diff = target_rev - est_rev
             rate = (est_rev / target_rev) if target_rev > 0 else 0
             
-            with cols[i % 3]:
+            with cols[i % 2]:
                 with st.container(border=True):
                     st.subheader(project)
-                    st.caption(f"分類：{p_data['營收分類'].iloc[0]}")
-                    m1, m2 = st.columns(2)
+                    st.caption(f"營收分類：{p_data['營收分類'].iloc[0]}")
+                    
+                    # 呈現指標：目標、預估、差異
+                    m1, m2, m3 = st.columns(3)
                     m1.metric("目標營收", f"${target_rev:,.0f}")
                     m2.metric("預估收入", f"${est_rev:,.0f}")
+                    # 差異標示：目標大於預估則顯示正數(缺口)
+                    m3.metric("差異 (缺口)", f"${revenue_diff:,.0f}", delta=revenue_diff, delta_color="inverse")
+                    
                     st.progress(min(rate, 1.0) if rate >= 0 else 0)
-                    st.write(f"達成率：{rate:.1%}")
+                    st.write(f"達成率：**{rate:.1%}**")
+                    
+                    # 新增功能：展開查看該專案所有紀錄 (收入、支出等)
+                    with st.expander(f"🔍 查看「{project}」專案明細"):
+                        # 只呈現需要的欄位，並過濾掉 ID
+                        detail_display = p_data.drop(columns=['id', '建立時間'])
+                        st.dataframe(detail_display, use_container_width=True)
 
-    # --- Tab 2: 營收分類彙整表 (修正 Typo 與 邏輯同步) ---
+    # --- Tab 2: 營收分類彙整表 (邏輯同步) ---
     with tab2:
         summary_list = []
         unique_cats = [c for c in df['營收分類'].unique() if c and str(c) != 'nan']
         
         for cat in unique_cats:
-            # 修正之前的 typo: 營營分類 -> 營收分類
             cat_df = df[df['營收分類'] == cat]
             
-            cat_target_rev = 0
-            cat_est_rev = 0
-            cat_target_exp = 0
-            cat_est_exp = 0
+            cat_target_rev, cat_est_rev = 0, 0
+            cat_target_exp, cat_est_exp = 0, 0
             
-            # 按專案細分計算再加總，確保符合卡片逻辑
             for proj in cat_df['專案說明'].unique():
                 proj_df = cat_df[cat_df['專案說明'] == proj]
                 
-                # 收入類 (第1筆目標, 第2筆預估)
+                # 收入加總邏輯
                 incs = proj_df[proj_df['紀錄類型'].str.contains('收入', na=False)]
                 p_target_rev = incs.iloc[0]['年度總額'] if len(incs) > 0 else 0
                 p_est_rev = incs.iloc[1]['年度總額'] if len(incs) > 1 else p_target_rev
                 
-                # 支出類 (第1筆目標支出[白底], 第2筆預估支出[粉底])
+                # 支出加總邏輯
                 exps = proj_df[proj_df['紀錄類型'].str.contains('支出', na=False)]
                 p_target_exp = exps.iloc[0]['年度總額'] if len(exps) > 0 else 0
                 p_est_exp = exps.iloc[1]['年度總額'] if len(exps) > 1 else p_target_exp
@@ -169,11 +178,11 @@ else:
                 cat_target_exp += p_target_exp
                 cat_est_exp += p_est_exp
             
-            # 計算指標 (按照您的要求)
+            # 計算財務指標
             target_profit = cat_target_rev - cat_target_exp
             est_profit = cat_est_rev - cat_est_exp
             est_margin = (est_profit / cat_est_rev) if cat_est_rev != 0 else 0
-            diff = cat_target_rev - cat_est_rev
+            total_diff = cat_target_rev - cat_est_rev
             
             summary_list.append({
                 "營收分類": cat,
@@ -182,19 +191,16 @@ else:
                 "目標毛利": target_profit,
                 "預估毛利": est_profit,
                 "預估毛利率": est_margin,
-                "差異(目標-預估)": diff
+                "差異(目標-預估)": total_diff
             })
         
         if summary_list:
             report_df = pd.DataFrame(summary_list)
             st.dataframe(
                 report_df.style.format({
-                    "目標收入": "{:,.0f}",
-                    "預估收入": "{:,.0f}",
-                    "目標毛利": "{:,.0f}",
-                    "預估毛利": "{:,.0f}",
-                    "預估毛利率": "{:.2%}",
-                    "差異(目標-預估)": "{:,.0f}"
+                    "目標收入": "{:,.0f}", "預估收入": "{:,.0f}",
+                    "目標毛利": "{:,.0f}", "預估毛利": "{:,.0f}",
+                    "預估毛利率": "{:.2%}", "差異(目標-預估)": "{:,.0f}"
                 }),
                 use_container_width=True
             )
