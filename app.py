@@ -22,32 +22,28 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收系統 v33", layout="wide")
+    st.set_page_config(page_title="車聯網營收系統 v34", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
-    # 🎯 絕對商業邏輯定義 (由使用者指定)
+    # 🎯 商業邏輯定義 (組合 A, B, C, D)
     # ==========================================
     def apply_business_rules(record_type, color_marker):
-        # 判定是否為粉紅色系 (包含各種可能的色碼與主題色標記)
+        # 判定是否為粉紅色系
         is_pink = any(k in color_marker for k in ["#F2DCDB", "#FCE4D6", "THEME_PINK", "#FFC7CE", "#FAD0C9", "#F8CBAD"])
-        # 判定是否為白色/灰色系 (包含無底色)
-        is_white_grey = color_marker == "無底色" or any(k in color_marker for k in ["#D9D9D9", "#D8D8D8", "#FFFFFF", "THEME_GREY", "#E7E6E6", "#F2F2F2"])
-
-        # 組合 A & B: 收入邏輯
+        
+        # 收入類
         if any(k in record_type for k in ["收入", "營收", "實績"]):
-            if is_pink: return "🔮 預估收入"
-            return "🎯 原目標收入"
+            return "🔮 預估收入" if is_pink else "🎯 原目標收入"
 
-        # 組合 C & D: 支出邏輯
+        # 支出類
         if any(k in record_type for k in ["支出", "成本"]):
-            if is_pink: return "💸 預估支出"
-            return "📉 原目標支出"
+            return "💸 預估支出" if is_pink else "📉 原目標支出"
             
         return "❌ 忽略不計"
 
     # ==========================================
-    # 1. 核心清洗引擎
+    # 1. 數據處理引擎
     # ==========================================
     def load_data():
         try:
@@ -80,7 +76,7 @@ if check_password():
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet = wb[wb.sheetnames[0]]
         
-        # 顏色掃描
+        # 顏色掃描：確保不漏掉任何底色
         color_list = []
         for row in sheet.iter_rows(min_row=4):
             final_marker = "無底色"
@@ -101,14 +97,13 @@ if check_password():
         df = pd.read_excel(uploaded_file, skiprows=2)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # 核心修復：先附加顏色與類型，再進行填補，最後才 dropna
+        # 附加顏色與紀錄類型
         df['顏色標記'] = color_list[:len(df)]
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
         
-        # 專案名稱填補
+        # --- 核心修復：分類與名稱填補 ---
         df['專案說明'] = df['專案說明'].replace(r'^\s*$', np.nan, regex=True).ffill()
         
-        # 營收分類填補 (解決 DCM 消失問題)
         cat_col = next((c for c in df.columns if '營收分類' in str(c)), None)
         if cat_col:
             df['營收分類'] = df[cat_col].astype(str).str.replace('\n', ' ').str.strip()
@@ -119,12 +114,9 @@ if check_password():
         # 數字清洗
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         for m in months:
-            if m in df.columns:
-                df[m] = df[m].apply(clean_currency)
-            else:
-                df[m] = 0.0
+            df[m] = df[m].apply(clean_currency) if m in df.columns else 0.0
 
-        # 孤兒數字救援 (解決 24DCM 數字 0 問題)
+        # 孤兒數字救援：如果 1-12 月是空的，就去抓小計
         fallback_cols = [c for c in df.columns if any(k in str(c) for k in ['小計', '總計', '合計', '實績'])]
         for idx, row in df.iterrows():
             if sum(row[months]) == 0:
@@ -139,14 +131,14 @@ if check_password():
         return df.dropna(subset=['紀錄類型'])[target_cols]
 
     # ==========================================
-    # 2. 介面呈現
+    # 2. UI 渲染
     # ==========================================
     with st.sidebar:
         st.header("📂 匯入數據")
         f = st.file_uploader("選擇 Excel", type=["xlsx"])
-        if f and st.button("🚀 匯入並自動執行商業規則"):
+        if f and st.button("🚀 匯入並自動計算報表"):
             save_to_supabase(process_imported_file(f))
-            st.success("匯入完成！已根據 A/B/C/D 組合自動歸位。")
+            st.success("匯入完成！")
             st.rerun()
 
     data = load_data()
@@ -155,28 +147,27 @@ if check_password():
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         df['年度總計'] = df[months].sum(axis=1)
 
-        # 套用使用者定義規則
+        # 套用規則
         df['財務屬性'] = df.apply(lambda row: apply_business_rules(str(row['紀錄類型']), str(row['顏色標記'])), axis=1)
 
-        tabs = st.tabs(["📈 營收分類彙整總表", "🎴 專案績效卡片", "📝 原始數據與診斷"])
+        tabs = st.tabs(["📈 營收分類彙整總表", "🎴 專案績效卡片", "📝 原始診斷數據"])
 
         with tabs[0]:
             st.subheader("📋 營收分類彙整總表")
-            # 建立透視表
             summary = df.groupby(['營收分類', '財務屬性'])['年度總計'].sum().unstack().fillna(0)
             
-            # 確保四大欄位存在
+            # 確保欄位齊全
             for c in ['🎯 原目標收入', '🔮 預估收入', '📉 原目標支出', '💸 預估支出']:
                 if c not in summary.columns: summary[c] = 0
             
-            # --- 套用使用者要求的計算公式 ---
+            # --- 商業公式計算 ---
             summary['原毛利'] = summary['🎯 原目標收入'] - summary['📉 原目標支出']
             summary['預計毛利'] = summary['🔮 預估收入'] - summary['💸 預估支出']
-            summary['差異'] = summary['🎯 原目標收入'] - summary['🔮 預估收入'] # 原目標收入 - 預估收入
+            summary['差異'] = summary['🎯 原目標收入'] - summary['🔮 預估收入'] # 目標 - 預估
             summary['毛利率'] = (summary['預計毛利'] / summary['🔮 預估收入']).replace([np.inf, -np.inf], 0).fillna(0)
             
-            final_table = summary[['🎯 原目標收入', '🔮 預估收入', '原毛利', '預計毛利', '差異', '毛利率']]
-            st.dataframe(final_table.reset_index().style.format({
+            display_df = summary[['🎯 原目標收入', '🔮 預估收入', '原毛利', '預計毛利', '差異', '毛利率']].reset_index()
+            st.dataframe(display_df.style.format({
                 '🎯 原目標收入': '{:,.0f}', '🔮 預估收入': '{:,.0f}', 
                 '原毛利': '{:,.0f}', '預計毛利': '{:,.0f}', 
                 '差異': '{:,.0f}', '毛利率': '{:.2%}'
@@ -189,26 +180,28 @@ if check_password():
             for idx, proj in enumerate(projects):
                 with cols[idx % 2]:
                     p_df = df[df['專案說明'] == proj]
-                    target_rev = p_df[p_df['財務屬性'] == '🎯 原目標收入']['年度總計'].sum()
-                    est_rev = p_df[p_df['財務屬性'] == '🔮 預估收入']['年度總計'].sum()
-                    est_exp = p_df[p_df['財務屬性'] == '💸 預估支出']['年度總計'].sum()
+                    # 預先計算，修復 NameError
+                    t_rev = p_df[p_df['財務屬性'] == '🎯 原目標收入']['年度總計'].sum()
+                    e_rev = p_df[p_df['財務屬性'] == '🔮 預估收入']['年度總計'].sum()
+                    t_exp = p_df[p_df['財務屬性'] == '📉 原目標支出']['年度總計'].sum()
+                    e_exp = p_df[p_df['財務屬性'] == '💸 預估支出']['年度總計'].sum()
                     
-                    est_profit = est_rev - est_exp
-                    achievement = (est_rev / target_rev) if target_rev != 0 else 0
+                    est_profit = e_rev - e_exp
+                    achievement = (e_rev / t_rev) if t_rev != 0 else 0
+                    diff_val = t_rev - e_rev
                     
                     with st.container(border=True):
                         st.markdown(f"#### {proj}")
-                        st.caption(f"分類：{p_df['營收分類'].iloc[0]}")
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("原目標收入", f"${target_rev:,.0f}")
-                        m2.metric("預估收入", f"${est_in := est_rev:,.0f}", f"{est_rev-target_rev:,.0f}")
+                        # 移除內建海象運算子以確保相容性
+                        m1.metric("原目標收入", f"${t_rev:,.0f}")
+                        m2.metric("預估收入", f"${e_rev:,.0f}", f"{-diff_val:,.0f}")
                         m3.metric("目標達成率", f"{achievement:.1%}")
                         
                         m4, m5 = st.columns(2)
                         m4.metric("預計毛利", f"${est_profit:,.0f}")
-                        m5.metric("預計毛利率", f"{(est_profit/est_rev*100 if est_rev != 0 else 0):.1f}%")
+                        m5.metric("預計毛利率", f"{(est_profit/e_rev*100 if e_rev != 0 else 0):.1f}%")
                         st.progress(min(max(achievement, 0.0), 1.0))
 
         with tabs[2]:
-            st.markdown("### 🔍 數據自動歸類檢查 (診斷器)")
-            st.dataframe(df[['專案說明', '紀錄類型', '顏色標記', '財務屬性', '年度總計', '營收分類']], use_container_width=True)
+            st.dataframe(df[['專案說明', '紀錄類型', '顏色標記', '財務屬性', '營收分類', '年度總計']], use_container_width=True)
