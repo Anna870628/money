@@ -25,13 +25,13 @@ def check_password():
     return True
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v8.1", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 最終版", layout="wide")
     
     # 建立雲端資料庫連線
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
-    # 1. 資料處理核心邏輯 (加入智能分頁防呆)
+    # 1. 資料處理核心邏輯 (極速寫入 & 防死結版)
     # ==========================================
     def load_data():
         try:
@@ -45,25 +45,23 @@ if check_password():
             return pd.DataFrame(columns=['專案說明', '紀錄類型', '營收分類', '說明'] + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
 
     def save_to_supabase(df):
-        with conn.session as session:
-            session.execute(text("DROP TABLE IF EXISTS financials")) 
-            df.to_sql('financials', conn.engine, if_exists='replace', index=False)
-            session.commit()
+        # 移除了容易造成死結的 session DROP，全權交給 Pandas 引擎處理覆蓋寫入
+        # 啟用 chunksize 與 method='multi' 大幅提升上傳速度
+        df.to_sql('financials', conn.engine, if_exists='replace', index=False, chunksize=500, method='multi')
 
     def process_imported_file(uploaded_file):
-        """讀取並清洗 Excel/CSV 資料，加入智能分頁辨識"""
+        """讀取並清洗 Excel/CSV 資料，加入智能分頁辨識與極速清理"""
         target_sheet = "預設"
         if uploaded_file.name.endswith(('.xlsx', '.xls')):
             excel_file = pd.ExcelFile(uploaded_file)
             sheet_names = excel_file.sheet_names
             
-            # 【修復1】智能尋找資料分頁 (避開格式說明的 Sheet)
+            # 智能尋找資料分頁
             target_sheet = sheet_names[0]
             for s in sheet_names:
                 if '營收' in s or '預估' in s or '收支' in s:
                     target_sheet = s
                     break
-            # 如果還是抓到專案說明，且有其他分頁，強制換一個
             if target_sheet == '專案說明' and len(sheet_names) > 1:
                 target_sheet = [s for s in sheet_names if s != '專案說明'][0]
                 
@@ -71,18 +69,19 @@ if check_password():
         else:
             df = pd.read_csv(uploaded_file, skiprows=2)
         
-        # 【修復2】清除所有欄位名稱前後的空白字元，防止 "專案說明 " 導致找不到
+        # 清除欄位名稱前後空白
         df.columns = [str(col).strip() for col in df.columns]
         
-        # 【修復3】如果還是找不到，拋出明確錯誤讓前端顯示
         if '專案說明' not in df.columns:
             found_cols = ", ".join([str(c) for c in df.columns])
-            raise ValueError(f"在分頁『{target_sheet}』中找不到『專案說明』欄位。\n系統實際讀到的欄位有：{found_cols}\n👉 解決方法：請確認資料是否從該分頁的第3行開始 (前兩行為標題)。")
+            raise ValueError(f"在分頁『{target_sheet}』中找不到『專案說明』欄位。\n讀到的欄位有：{found_cols}")
 
-        # 欄位基本清理
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
-        df['專案說明'] = df['專案說明'].ffill()
         
+        # 剔除 Excel 幽靈空白列，加速上傳
+        df['專案說明'] = df['專案說明'].replace(r'^\s*$', pd.NA, regex=True).ffill()
+        df = df.dropna(subset=['專案說明'])
+
         # 營收分類處理
         cat_col = [c for c in df.columns if '營收分類' in str(c)]
         if cat_col:
@@ -98,12 +97,14 @@ if check_password():
             else:
                 df[m] = 0.0
                 
-        # 確保說明欄位存在
         if '說明' not in df.columns:
             df['說明'] = ""
-                
+            
         target_cols = ['專案說明', '紀錄類型'] + months + ['營收分類', '說明']
-        return df[df['專案說明'].notna()][target_cols]
+        
+        # 剔除沒有紀錄類型的無效行
+        df = df.dropna(subset=['紀錄類型'])
+        return df[target_cols]
 
     # ==========================================
     # 2. 介面分頁規劃
@@ -166,18 +167,26 @@ if check_password():
         
         with st.sidebar:
             st.header("📂 數據匯入")
-            file = st.file_uploader("匯入 Excel 檔案 (.xlsx)", type=["xlsx"])
+            file = st.file_uploader("匯入 Excel 檔案 (.xlsx)", type=["xlsx", "csv"])
             if file and st.button("🚀 開始解析並覆蓋雲端"):
-                with st.spinner("處理中..."):
+                with st.spinner("極速處理中..."):
                     try:
                         new_df = process_imported_file(file)
                         save_to_supabase(new_df)
                         st.success("匯入成功！")
                         st.rerun()
                     except Exception as e:
-                        # 【修復4】如果發生錯誤，會明確在側邊欄印出原因，不會當機
                         st.error(f"解析失敗！\n{e}")
             
+            st.divider()
+            
+            # 使用 engine 執行避免死結
+            if st.button("⚠️ 清空資料庫 (重來)"):
+                with conn.engine.begin() as db_conn:
+                    db_conn.execute(text("DROP TABLE IF EXISTS financials"))
+                st.warning("資料庫已清空，請重新匯入檔案")
+                st.rerun()
+                
             st.divider()
             if st.button("🚪 安全登出"):
                 st.session_state["password_correct"] = False
@@ -196,9 +205,10 @@ if check_password():
         )
         
         if st.button("💾 儲存變更", type="primary"):
-            save_to_supabase(edited_df)
-            st.success("雲端資料已更新！")
-            st.rerun()
+            with st.spinner("同步中..."):
+                save_to_supabase(edited_df)
+                st.success("雲端資料已更新！")
+                st.rerun()
 
     # --- TAB 3: 分類分析摘要 ---
     with tab_summary:
