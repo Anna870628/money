@@ -25,13 +25,13 @@ def check_password():
     return True
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v8", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v8.1", layout="wide")
     
     # 建立雲端資料庫連線
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
-    # 1. 資料處理核心邏輯
+    # 1. 資料處理核心邏輯 (加入智能分頁防呆)
     # ==========================================
     def load_data():
         try:
@@ -46,18 +46,39 @@ if check_password():
 
     def save_to_supabase(df):
         with conn.session as session:
-            # 確保結構一致，儲存時採用替換模式
             session.execute(text("DROP TABLE IF EXISTS financials")) 
             df.to_sql('financials', conn.engine, if_exists='replace', index=False)
             session.commit()
 
     def process_imported_file(uploaded_file):
-        """讀取並清洗 Excel/CSV 資料"""
+        """讀取並清洗 Excel/CSV 資料，加入智能分頁辨識"""
+        target_sheet = "預設"
         if uploaded_file.name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(uploaded_file, skiprows=2)
+            excel_file = pd.ExcelFile(uploaded_file)
+            sheet_names = excel_file.sheet_names
+            
+            # 【修復1】智能尋找資料分頁 (避開格式說明的 Sheet)
+            target_sheet = sheet_names[0]
+            for s in sheet_names:
+                if '營收' in s or '預估' in s or '收支' in s:
+                    target_sheet = s
+                    break
+            # 如果還是抓到專案說明，且有其他分頁，強制換一個
+            if target_sheet == '專案說明' and len(sheet_names) > 1:
+                target_sheet = [s for s in sheet_names if s != '專案說明'][0]
+                
+            df = pd.read_excel(uploaded_file, sheet_name=target_sheet, skiprows=2)
         else:
             df = pd.read_csv(uploaded_file, skiprows=2)
         
+        # 【修復2】清除所有欄位名稱前後的空白字元，防止 "專案說明 " 導致找不到
+        df.columns = [str(col).strip() for col in df.columns]
+        
+        # 【修復3】如果還是找不到，拋出明確錯誤讓前端顯示
+        if '專案說明' not in df.columns:
+            found_cols = ", ".join([str(c) for c in df.columns])
+            raise ValueError(f"在分頁『{target_sheet}』中找不到『專案說明』欄位。\n系統實際讀到的欄位有：{found_cols}\n👉 解決方法：請確認資料是否從該分頁的第3行開始 (前兩行為標題)。")
+
         # 欄位基本清理
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
         df['專案說明'] = df['專案說明'].ffill()
@@ -77,6 +98,10 @@ if check_password():
             else:
                 df[m] = 0.0
                 
+        # 確保說明欄位存在
+        if '說明' not in df.columns:
+            df['說明'] = ""
+                
         target_cols = ['專案說明', '紀錄類型'] + months + ['營收分類', '說明']
         return df[df['專案說明'].notna()][target_cols]
 
@@ -86,36 +111,31 @@ if check_password():
     st.title("📊 車聯網事業本部 - 營收管理戰情室")
     
     tab_cards, tab_edit, tab_summary = st.tabs([
-        "🎴 專案戰情卡片 (Card View)", 
-        "📝 原始數據管理 (Table View)", 
-        "📈 分類分析摘要 (Summary)"
+        "🎴 專案戰情卡片", 
+        "📝 原始數據管理", 
+        "📈 分類分析摘要"
     ])
 
-    # 讀取資料
     data = load_data()
 
     # --- TAB 1: 專案戰情卡片 ---
     with tab_cards:
         if data.empty:
-            st.warning("目前資料庫無資料，請先至『數據管理』分頁匯入 Excel 檔案。")
+            st.warning("目前資料庫無資料，請先至『原始數據管理』分頁匯入 Excel 檔案。")
         else:
             st.subheader("💡 專案績效概覽")
-            
-            # 分類篩選
             cats = ["全部分類"] + list(data['營收分類'].unique())
             sel_cat = st.selectbox("依分類篩選", cats, key="card_filter")
             
             card_df = data if sel_cat == "全部分類" else data[data['營收分類'] == sel_cat]
             projects = card_df['專案說明'].unique()
             
-            # 卡片佈局：一列兩張
             cols = st.columns(2)
             for idx, proj in enumerate(projects):
                 with cols[idx % 2]:
                     p_df = card_df[card_df['專案說明'] == proj]
                     months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
                     
-                    # 彙整關鍵指標 (年度總計)
                     target_rev = p_df[p_df['紀錄類型'] == '收入'][months].sum().sum()
                     est_rev = p_df[p_df['紀錄類型'] == '收入預估'][months].sum().sum()
                     est_exp = p_df[p_df['紀錄類型'] == '支出預估'][months].sum().sum()
@@ -124,7 +144,6 @@ if check_password():
                     margin = (profit / est_rev) if est_rev != 0 else 0
                     diff = est_rev - target_rev
                     
-                    # 繪製卡片
                     with st.container(border=True):
                         st.markdown(f"#### {proj}")
                         st.caption(f"營收分類：{p_df['營收分類'].iloc[0]}")
@@ -134,7 +153,6 @@ if check_password():
                         m2.metric("年度預估營收", f"${est_rev:,.0f}", f"{diff:,.0f}")
                         m3.metric("預估毛利率", f"{margin:.1%}")
                         
-                        # 進度條
                         reach = (est_rev / target_rev) if target_rev != 0 else 0
                         st.write(f"**目標達成率: {reach:.1%}**")
                         st.progress(min(reach, 1.0))
@@ -146,35 +164,33 @@ if check_password():
     with tab_edit:
         st.info("提示：此處可直接編輯數值、下拉選單，或上傳新檔案。")
         
-        # 側邊欄匯入
         with st.sidebar:
             st.header("📂 數據匯入")
             file = st.file_uploader("匯入 Excel 檔案 (.xlsx)", type=["xlsx"])
             if file and st.button("🚀 開始解析並覆蓋雲端"):
                 with st.spinner("處理中..."):
-                    new_df = process_imported_file(file)
-                    save_to_supabase(new_df)
-                    st.success("匯入成功！")
-                    st.rerun()
+                    try:
+                        new_df = process_imported_file(file)
+                        save_to_supabase(new_df)
+                        st.success("匯入成功！")
+                        st.rerun()
+                    except Exception as e:
+                        # 【修復4】如果發生錯誤，會明確在側邊欄印出原因，不會當機
+                        st.error(f"解析失敗！\n{e}")
             
             st.divider()
             if st.button("🚪 安全登出"):
                 st.session_state["password_correct"] = False
                 st.rerun()
 
-        # 數據編輯器
         edited_df = st.data_editor(
             data,
             num_rows="dynamic",
             use_container_width=True,
             height=500,
             column_config={
-                "營收分類": st.column_config.SelectboxColumn(
-                    "營收分類", options=["24DCM開發/維運", "TOYOTA聯網服務", "LEXUS聯網服務", "其他"]
-                ),
-                "紀錄類型": st.column_config.SelectboxColumn(
-                    "紀錄類型", options=["收入", "收入預估", "支出", "支出預估", "收入差異", "支出差異"]
-                ),
+                "營收分類": st.column_config.SelectboxColumn("營收分類", options=["24DCM開發/維運", "TOYOTA聯網服務", "LEXUS聯網服務", "其他"]),
+                "紀錄類型": st.column_config.SelectboxColumn("紀錄類型", options=["收入", "收入預估", "支出", "支出預估", "收入差異", "支出差異"]),
                 **{m: st.column_config.NumberColumn(format="%.0f") for m in ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']}
             }
         )
@@ -192,7 +208,6 @@ if check_password():
             months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
             df_sum['年度總計'] = df_sum[months].sum(axis=1)
 
-            # 按分類加總
             summary = pd.DataFrame({
                 '目標營收': df_sum[df_sum['紀錄類型'] == '收入'].groupby('營收分類')['年度總計'].sum(),
                 '預估營收': df_sum[df_sum['紀錄類型'] == '收入預估'].groupby('營收分類')['年度總計'].sum(),
@@ -204,7 +219,6 @@ if check_password():
             summary['預估毛利'] = summary['預估營收'] - summary['預估支出']
             summary['預估毛利率'] = (summary['預估毛利'] / summary['預估營收']).replace([float('inf'), -float('inf')], 0).fillna(0)
 
-            # 樣式：負數變紅
             def style_negative_red(val):
                 if isinstance(val, (int, float)) and val < 0:
                     return 'color: red'
