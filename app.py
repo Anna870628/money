@@ -22,7 +22,7 @@ def check_password():
     return st.session_state.get("password_correct", False)
 
 if check_password():
-    st.set_page_config(page_title="車聯網營收戰情系統 v21", layout="wide")
+    st.set_page_config(page_title="車聯網營收戰情系統 v22", layout="wide")
     conn = st.connection("postgresql", type="sql")
 
     # ==========================================
@@ -46,6 +46,7 @@ if check_password():
         df.to_sql('financials', conn.engine, if_exists='append', index=False, chunksize=50, method='multi')
 
     def clean_currency(val):
+        """強制把 $、逗號、括號(負數) 轉成純數字"""
         if pd.isna(val): return 0.0
         val_str = str(val).strip()
         if not val_str or val_str.lower() in ['nan', 'none', 'null']: return 0.0
@@ -67,10 +68,11 @@ if check_password():
                 break
         sheet = wb[target_s]
         
+        # 讀取顏色 (保留為參考標籤，但不參與核心計算)
         color_list = []
         for row in sheet.iter_rows(min_row=4):
             color_id = "無底色"
-            for cell in [row[1], row[2], row[19]]: 
+            for cell in [row[1], row[2]]: 
                 fill = cell.fill
                 if fill and hasattr(fill, 'start_color') and fill.start_color:
                     sc = fill.start_color
@@ -79,21 +81,6 @@ if check_password():
                         if val != '00000000' and val != '000000': 
                             color_id = f"色碼_{val[-6:].upper()}"
                             break
-                    elif getattr(sc, 'type', None) == 'theme':
-                        color_id = f"主題色_T{getattr(sc, 'theme', '未知')}_色偏{getattr(sc, 'tint', 0.0)}"
-                        break
-                    elif getattr(sc, 'type', None) == 'indexed':
-                        color_id = f"索引色_{getattr(sc, 'indexed', '未知')}"
-                        break
-                    else:
-                        try:
-                            raw = str(getattr(sc, 'rgb', '無RGB資料'))
-                            if raw != '00000000' and raw != '無RGB資料':
-                                safe_raw = "".join(char for char in raw if char.isalnum())
-                                color_id = f"特殊格式_{safe_raw[-6:]}"
-                                break
-                        except:
-                            pass
             color_list.append(color_id)
 
         uploaded_file.seek(0)
@@ -103,21 +90,19 @@ if check_password():
         df['顏色標記'] = color_list[:len(df)]
         df.rename(columns={df.columns[2]: '紀錄類型'}, inplace=True)
         df['專案說明'] = df['專案說明'].replace(r'^\s*$', pd.NA, regex=True).ffill()
+        df['紀錄類型'] = df['紀錄類型'].astype(str)
         
-        # --- 修復分類掉失的問題 (使用 np.nan) ---
-        cat_col_name = ""
-        for c in df.columns:
-            if '營收分類' in str(c):
-                cat_col_name = c
-                break
-        
+        # --- 精準清洗營收分類 ---
+        cat_col_name = next((c for c in df.columns if '營收分類' in str(c)), None)
         if cat_col_name:
-            df['營收分類'] = df[cat_col_name].astype(str).str.replace('\n', ' ').str.strip()
+            # 去除換行符號，確保向下填補不會斷層
+            df['營收分類'] = df[cat_col_name].astype(str).str.replace('\n', ' ').str.replace('\r', '').str.strip()
             df['營收分類'] = df['營收分類'].replace(['nan', 'None', '', '<NA>', 'NaN'], np.nan)
             df['營收分類'] = df['營收分類'].ffill().fillna("其他")
         else:
             df['營收分類'] = "其他"
         
+        # --- 處理 1-12 月數字 ---
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         for m in months:
             if m in df.columns:
@@ -125,35 +110,35 @@ if check_password():
             else:
                 df[m] = 0.0
 
-        # --- 孤兒數字救援 (加上 clean_currency) ---
+        # --- 🚀 孤兒數字救援引擎 ---
+        # 如果 1-12 月加總為 0，去後面的「小計」欄位抓回來
         fallback_cols = [c for c in df.columns if any(k in str(c) for k in ['小計', '總計', '合計', '實績'])]
-        df['temp_sum'] = df[months].sum(axis=1)
         for idx, row in df.iterrows():
-            if row['temp_sum'] == 0:
+            temp_sum = sum(row[m] for m in months if pd.notna(row[m]))
+            if temp_sum == 0:
                 for f_col in fallback_cols:
                     if f_col in row:
                         val = clean_currency(row[f_col])
                         if val != 0:
                             df.at[idx, 'Jan'] = val
                             break
-        df = df.drop(columns=['temp_sum'])
         
         if '說明' not in df.columns: df['說明'] = ""
         target_cols = ['專案說明', '紀錄類型'] + months + ['營收分類', '顏色標記', '說明']
         return df.dropna(subset=['專案說明', '紀錄類型'])[target_cols]
 
     # ==========================================
-    # 2. 側邊欄
+    # 2. 側邊欄：匯入機制
     # ==========================================
     with st.sidebar:
         st.header("📂 匯入數據")
         f = st.file_uploader("選擇 Excel", type=["xlsx"])
         if f and st.button("🚀 開始解析並上傳"):
-            with st.spinner("強制淨化數字格式與清洗分類..."):
+            with st.spinner("資料清洗與自動對齊中..."):
                 try:
                     new_df = process_imported_file(f)
                     save_to_supabase(new_df)
-                    st.success("匯入成功！所有符號皆已清除。")
+                    st.success("匯入成功！已自動完成彙整。")
                     st.rerun()
                 except Exception as e:
                     st.error(f"解析失敗: {e}")
@@ -177,80 +162,26 @@ if check_password():
         df_sum = data.copy()
         months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         df_sum['年度總計'] = df_sum[months].sum(axis=1)
-        
-        unique_colors = df_sum['顏色標記'].dropna().unique().tolist()
-        if "無底色" not in unique_colors: unique_colors.insert(0, "無底色")
-        unique_records = df_sum['紀錄類型'].dropna().unique().tolist()
 
-        # 智能預設選項
-        def_t_c = [c for c in unique_colors if 'D9D9D9' in str(c) or 'D8D8D8' in str(c)]
-        def_e_c = [c for c in unique_colors if 'F2DCDB' in str(c) or 'FCE4D6' in str(c)]
-        
-        def_t_inc = [r for r in unique_records if r in ['收入', '營收', '實績', '總收入', '續約收入', '洗車捆包收入']]
-        def_e_inc = [r for r in unique_records if r in ['收入預估', '預估收入', '總預估收入']]
-        def_t_exp = [r for r in unique_records if r in ['支出', '成本', '實際支出', '總支出', '續約支出', '洗車捆包支出']]
-        def_e_exp = [r for r in unique_records if r in ['支出預估', '預估支出', '總預估支出']]
+        # --- 🚀 極簡硬派邏輯 (不再依賴 UI，絕對不會錯) ---
+        # 1. 抓出基礎屬性
+        is_inc = df_sum['紀錄類型'].str.contains('收入|營收|實績', na=False)
+        is_exp = df_sum['紀錄類型'].str.contains('支出|成本', na=False)
+        is_est = df_sum['紀錄類型'].str.contains('預估', na=False)
+        is_diff = df_sum['紀錄類型'].str.contains('差異', na=False)
 
-        # --- 🚀 完美解耦的設定面板 ---
-        with st.expander("⚙️ 第 1 步：定義報表邏輯 (完全杜絕關鍵字重複問題)", expanded=True):
-            st.info("💡 現在「收入」與「支出」完全獨立。支出不需要選顏色，只要文字對了就會算！")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("🎯 **目標收支設定**")
-                t_inc_txt = st.multiselect("💰 原目標收入 (文字)", unique_records, default=def_t_inc)
-                t_colors = st.multiselect("🎨 原目標收入 (底色/選填)", unique_colors, default=def_t_c)
-                t_exp_txt = st.multiselect("📉 實際支出 (文字)", unique_records, default=def_t_exp)
-            with c2:
-                st.markdown("🔮 **預估收支設定**")
-                e_inc_txt = st.multiselect("💰 預估收入 (文字)", unique_records, default=def_e_inc)
-                e_colors = st.multiselect("🎨 預估收入 (底色/選填)", unique_colors, default=def_e_c)
-                e_exp_txt = st.multiselect("💸 預估支出 (文字)", unique_records, default=def_e_exp)
+        # 2. 嚴格定義四象限
+        target_mask = is_inc & ~is_est & ~is_diff   # 原目標：是收入，不能有預估，不能是差異
+        est_inc_mask = is_inc & is_est              # 預估收入：是收入，且是預估
+        actual_exp_mask = is_exp & ~is_est & ~is_diff # 實際支出：是支出，不能有預估
+        est_exp_mask = is_exp & is_est              # 預估支出：是支出，且是預估
 
-        # 產生嚴謹的過濾條件
-        t_inc_mask = df_sum['紀錄類型'].isin(t_inc_txt)
-        if t_colors: t_inc_mask = t_inc_mask & df_sum['顏色標記'].isin(t_colors)
+        tabs = st.tabs(["🎴 專案卡片摘要", "📈 營收分類總表", "📝 原始數據管理"])
 
-        e_inc_mask = df_sum['紀錄類型'].isin(e_inc_txt)
-        if e_colors: e_inc_mask = e_inc_mask & df_sum['顏色標記'].isin(e_colors)
-
-        t_exp_mask = df_sum['紀錄類型'].isin(t_exp_txt)
-        e_exp_mask = df_sum['紀錄類型'].isin(e_exp_txt)
-
-        tabs = st.tabs(["📈 營收分類總表", "🎴 專案卡片摘要", "📝 原始數據管理"])
-
-        # --- TAB 1: 營收分類總表 ---
+        # --- TAB 1: 專案卡片摘要 ---
         with tabs[0]:
-            st.subheader("📋 營收分類戰情總表")
-            unique_cats = df_sum['營收分類'].unique().tolist()
-            summary = pd.DataFrame(index=unique_cats)
-            
-            summary['原目標收入'] = df_sum[t_inc_mask].groupby('營收分類')['年度總計'].sum()
-            summary['預估收入'] = df_sum[e_inc_mask].groupby('營收分類')['年度總計'].sum()
-            summary['實際支出'] = df_sum[t_exp_mask].groupby('營收分類')['年度總計'].sum()
-            summary['預估支出'] = df_sum[e_exp_mask].groupby('營收分類')['年度總計'].sum()
-            
-            summary = summary.fillna(0)
-            summary['原毛利'] = summary['原目標收入'] - summary['實際支出']
-            summary['預估毛利'] = summary['預估收入'] - summary['預估支出']
-            summary['差異'] = summary['預估收入'] - summary['原目標收入']
-            summary['毛利率'] = (summary['預估毛利'] / summary['預估收入']).replace([float('inf'), -float('inf')], 0).fillna(0)
-
-            summary = summary.reset_index().rename(columns={'index': '營收分類'})
-            display_cols = ['營收分類', '原目標收入', '預估收入', '原毛利', '預估毛利', '差異', '毛利率']
-            
-            st.dataframe(
-                summary[display_cols].style.format({
-                    '原目標收入': '{:,.0f}', '預估收入': '{:,.0f}', 
-                    '原毛利': '{:,.0f}', '預估毛利': '{:,.0f}', 
-                    '差異': '{:,.0f}', '毛利率': '{:.2%}'
-                }).map(lambda x: 'color: red' if isinstance(x, (int, float)) and x < 0 else '', subset=['差異', '預估毛利']),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        # --- TAB 2: 專案卡片摘要 ---
-        with tabs[1]:
             st.subheader("💡 專案績效一覽表")
+            unique_cats = df_sum['營收分類'].unique().tolist()
             cats = ["全部分類"] + unique_cats
             sel_cat = st.selectbox("篩選營收分類", cats, key="card_filter")
             
@@ -262,17 +193,15 @@ if check_password():
                 with cols[idx % 2]:
                     p_df = display_data[display_data['專案說明'] == proj]
                     
-                    p_t_inc = p_df['紀錄類型'].isin(t_inc_txt)
-                    if t_colors: p_t_inc = p_t_inc & p_df['顏色標記'].isin(t_colors)
-                        
-                    p_e_inc = p_df['紀錄類型'].isin(e_inc_txt)
-                    if e_colors: p_e_inc = p_e_inc & p_df['顏色標記'].isin(e_colors)
-                        
-                    p_e_exp = p_df['紀錄類型'].isin(e_exp_txt)
-                    
-                    target = p_df[p_t_inc]['年度總計'].sum()
-                    est_in = p_df[p_e_inc]['年度總計'].sum()
-                    est_out = p_df[p_e_exp]['年度總計'].sum()
+                    # 依專案切片的遮罩
+                    p_is_inc = p_df['紀錄類型'].str.contains('收入|營收|實績', na=False)
+                    p_is_exp = p_df['紀錄類型'].str.contains('支出|成本', na=False)
+                    p_is_est = p_df['紀錄類型'].str.contains('預估', na=False)
+                    p_is_diff = p_df['紀錄類型'].str.contains('差異', na=False)
+
+                    target = p_df[p_is_inc & ~p_is_est & ~p_is_diff]['年度總計'].sum()
+                    est_in = p_df[p_is_inc & p_is_est]['年度總計'].sum()
+                    est_out = p_df[p_is_exp & p_is_est]['年度總計'].sum()
                     
                     profit = est_in - est_out
                     margin = (profit / est_in) if est_in != 0 else 0
@@ -292,7 +221,39 @@ if check_password():
                         st.progress(min(max(reach, 0.0), 1.0))
                         
                         with st.expander("查看明細數據"):
-                            st.dataframe(p_df[['紀錄類型', '顏色標記', '年度總計']], use_container_width=True)
+                            st.dataframe(p_df[['紀錄類型', '年度總計']], use_container_width=True, hide_index=True)
+
+        # --- TAB 2: 營收分類總表 ---
+        with tabs[1]:
+            st.subheader("📋 營收分類戰情總表")
+            
+            # 使用我們嚴格定義的遮罩，依照分類直接 Groupby
+            summary = pd.DataFrame(index=unique_cats)
+            summary['原目標收入'] = df_sum[target_mask].groupby('營收分類')['年度總計'].sum()
+            summary['預估收入'] = df_sum[est_inc_mask].groupby('營收分類')['年度總計'].sum()
+            summary['實際支出'] = df_sum[actual_exp_mask].groupby('營收分類')['年度總計'].sum()
+            summary['預估支出'] = df_sum[est_exp_mask].groupby('營收分類')['年度總計'].sum()
+            
+            summary = summary.fillna(0)
+
+            summary['原毛利'] = summary['原目標收入'] - summary['實際支出']
+            summary['預估毛利'] = summary['預估收入'] - summary['預估支出']
+            summary['差異'] = summary['預估收入'] - summary['原目標收入']
+            summary['毛利率'] = (summary['預估毛利'] / summary['預估收入']).replace([float('inf'), -float('inf')], 0).fillna(0)
+
+            # 將 Index 轉成實體欄位
+            summary = summary.reset_index().rename(columns={'index': '營收分類'})
+            display_cols = ['營收分類', '原目標收入', '預估收入', '原毛利', '預估毛利', '差異', '毛利率']
+            
+            st.dataframe(
+                summary[display_cols].style.format({
+                    '原目標收入': '{:,.0f}', '預估收入': '{:,.0f}', 
+                    '原毛利': '{:,.0f}', '預估毛利': '{:,.0f}', 
+                    '差異': '{:,.0f}', '毛利率': '{:.2%}'
+                }).map(lambda x: 'color: red' if isinstance(x, (int, float)) and x < 0 else '', subset=['差異', '預估毛利']),
+                use_container_width=True,
+                hide_index=True
+            )
 
         # --- TAB 3: 原始數據管理 ---
         with tabs[2]:
