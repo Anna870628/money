@@ -1,45 +1,41 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text
+import numpy as np
 
-# 1. 頁面配置
-st.set_page_config(page_title="車聯網專案營收管理", layout="wide")
+# 1. 頁面配置與深色系視覺優化
+st.set_page_config(page_title="車聯網營收戰情室", layout="wide")
 
-# --- CSS 視覺強化設計 ---
+# 強制自定義 CSS：解決看板底色太白、側邊欄看不清的問題
 st.markdown("""
     <style>
-    /* 全域背景色 */
-    .stApp { background-color: #f4f7f9; }
-    
-    /* 強制側邊欄顏色：深色背景，亮色文字 */
+    /* 全域背景稍微帶一點灰，增加對比 */
+    .stApp {
+        background-color: #f4f7f9;
+    }
+    /* 側邊欄強制深色 */
     [data-testid="stSidebar"] {
-        background-color: #1e2124 !important;
-        color: #ffffff !important;
+        background-color: #1e1e2d !important;
+        color: white !important;
     }
-    [data-testid="stSidebar"] .stMarkdown p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] .stHeader {
-        color: #ffffff !important;
+    [data-testid="stSidebar"] .stMarkdown p, [data-testid="stSidebar"] label {
+        color: #cfcfd8 !important;
     }
-
-    /* 專案卡片樣式：灰色底色以利區分白色背景 */
+    /* 看板卡片樣式：深藍色邊框與陰影，確保白色底色也看得很清楚 */
     .project-card {
-        background-color: #e9ecef; 
+        background-color: #ffffff;
         padding: 20px;
         border-radius: 12px;
-        border: 1px solid #ced4da;
+        border-left: 8px solid #1f4e79;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         margin-bottom: 20px;
-        box-shadow: 2px 2px 8px rgba(0,0,0,0.05);
     }
-    
-    /* Metric 數值框樣式優化 */
-    div[data-testid="stMetric"] {
-        background-color: #ffffff;
-        padding: 10px;
+    .stMetric {
+        background-color: #f8f9fa;
+        border: 1px solid #eee;
         border-radius: 8px;
-        border: 1px solid #dee2e6;
+        padding: 10px;
     }
-    
-    .project-title { color: #0d47a1; font-weight: bold; font-size: 1.5rem; }
-    .category-label { background-color: #6c757d; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -47,15 +43,17 @@ st.markdown("""
 try:
     conn = st.connection("postgresql", type="sql")
 except Exception as e:
-    st.error("❌ 資料庫連線失敗")
+    st.error("❌ 資料庫連線失敗，請檢查 Secrets 設定。")
     st.stop()
 
-# --- 核心工具：資料清洗 ---
+# --- 核心工具：數據清理 ---
 def clean_num(val):
+    """將 Excel 中的 '-' 或非數字字元轉為 0.0"""
     v = pd.to_numeric(val, errors='coerce')
     return float(v) if not pd.isna(v) else 0.0
 
 def get_db_data():
+    """抓取資料並清理字串空白"""
     df = conn.query('SELECT * FROM financials ORDER BY id ASC', ttl=0)
     if not df.empty:
         for col in df.select_dtypes(['object']).columns:
@@ -63,41 +61,48 @@ def get_db_data():
     return df
 
 # ==========================================
-# ⬅️ 左側邊欄：控制台
+# ⬅️ 側邊欄：匯入與管理
 # ==========================================
 with st.sidebar:
-    st.title("📂 營收數據中心")
+    st.title("🗄️ 營收管理後台")
     
-    uploaded_file = st.file_uploader("匯入 2026 專案 Excel", type=["xlsx"])
+    st.subheader("📥 匯入 Excel 報表")
+    uploaded_file = st.file_uploader("選擇 2026 專案 Excel", type=["xlsx"])
+    
     if uploaded_file:
         try:
-            # 偵測標題列並讀取
-            temp_df = pd.read_excel(uploaded_file, nrows=10)
-            header_row = 0
+            # 💡 根據你的 Excel 結構：標題通常在第 3 列 (Index 2)
+            # 自動偵測「專案說明」所在行
+            temp_df = pd.read_excel(uploaded_file, nrows=15)
+            header_idx = 0
             for i, row in temp_df.iterrows():
-                if "專案說明" in str(row.values):
-                    header_row = i + 1
+                if "專案說明" in [str(v).strip() for v in row.values]:
+                    header_idx = i + 1
                     break
             
-            new_df = pd.read_excel(uploaded_file, header=header_row)
-            new_df.columns = [str(c).strip() for c in new_df.columns]
+            # 正式讀取
+            raw_df = pd.read_excel(uploaded_file, header=header_idx)
+            raw_df.columns = [str(c).strip() for c in raw_df.columns]
             
-            # 處理無標題的「紀錄類型」
-            if "專案說明" in new_df.columns:
-                p_idx = new_df.columns.get_loc("專案說明")
-                if p_idx + 1 < len(new_df.columns):
-                    new_df = new_df.rename(columns={new_df.columns[p_idx + 1]: "紀錄類型"})
+            # 處理「紀錄類型」 (專案說明右邊那欄)
+            if "專案說明" in raw_df.columns:
+                p_idx = raw_df.columns.get_loc("專案說明")
+                type_col = raw_df.columns[p_idx + 1]
+                raw_df = raw_df.rename(columns={type_col: "紀錄類型"})
             
-            # 合併儲存格填充
-            new_df['專案說明'] = new_df['專案說明'].ffill()
-            if "營收分類" in new_df.columns:
-                new_df['營收分類'] = new_df['營營分類'].ffill()
+            # 處理合併儲存格：專案名稱與分類向下填充
+            raw_df['專案說明'] = raw_df['專案說明'].ffill()
+            if "營收分類" in raw_df.columns:
+                raw_df['營收分類'] = raw_df['營收分類'].ffill()
 
-            if st.button("🚀 確認寫入資料庫", use_container_width=True):
+            st.success(f"✅ 檔案讀取成功 (Header 行數: {header_idx})")
+            
+            if st.button("🚀 確認並覆蓋資料庫", use_container_width=True):
                 with conn.session as s:
-                    for _, r in new_df.iterrows():
+                    s.execute(text("TRUNCATE TABLE financials;")) # 每次匯入先清空，維持資料一致
+                    for _, r in raw_df.iterrows():
                         p_name = str(r.get('專案說明', ''))
-                        if pd.isna(r.get('專案說明')) or "序號" in p_name: continue
+                        if "序號" in p_name or pd.isna(r.get('專案說明')): continue
                         
                         sql = text("""
                             INSERT INTO financials ("專案說明", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "營收分類", "紀錄類型", "說明")
@@ -105,119 +110,131 @@ with st.sidebar:
                         """)
                         s.execute(sql, {
                             "p": p_name, "cat": str(r.get('營收分類', '其他')),
-                            "type": str(r.get('紀錄類型', '收入')), "desc": str(r.get('說明', '')),
-                            "m1": clean_num(r.get('Jan')), "m2": clean_num(r.get('Feb')), "m3": clean_num(r.get('Mar')),
-                            "m4": clean_num(r.get('Apr')), "m5": clean_num(r.get('May')), "m6": clean_num(r.get('Jun')),
-                            "m7": clean_num(r.get('Jul')), "m8": clean_num(r.get('Aug')), "m9": clean_num(r.get('Sep')),
-                            "m10": clean_num(r.get('Oct')), "m11": clean_num(r.get('Nov')), "m12": clean_num(r.get('Dec'))
+                            "type": str(r.get('紀錄類型', '未知')), "desc": str(r.get('說明', '')),
+                            "m1": clean_num(r.get('Jan')), "m2": clean_num(r.get('Feb')), 
+                            "m3": clean_num(r.get('Mar')), "m4": clean_num(r.get('Apr')), 
+                            "m5": clean_num(r.get('May')), "m6": clean_num(r.get('Jun')), 
+                            "m7": clean_num(r.get('Jul')), "m8": clean_num(r.get('Aug')), 
+                            "m9": clean_num(r.get('Sep')), "m10": clean_num(r.get('Oct')), 
+                            "m11": clean_num(r.get('Nov')), "m12": clean_num(r.get('Dec'))
                         })
                     s.commit()
-                st.toast("數據匯入成功！")
                 st.rerun()
         except Exception as e:
             st.error(f"解析失敗: {e}")
 
     st.divider()
-    if st.button("🗑️ 清空資料庫", type="primary", use_container_width=True):
+    if st.button("🗑️ 清空所有資料庫內容", type="primary", use_container_width=True):
         with conn.session as s:
             s.execute(text("TRUNCATE TABLE financials;"))
             s.commit()
         st.rerun()
 
 # ==========================================
-# 🏠 主畫面內容
+# 🏠 主畫面：看板與彙整分析
 # ==========================================
-st.title("📊 車聯網事業本部 - 專案彙整")
+st.title("📊 車聯網專案營收戰情室")
 df = get_db_data()
 
 if df.empty:
-    st.info("👋 目前尚無數據，請先由左側上傳 Excel。")
+    st.info("👋 目前尚無數據，請先從左側匯入 Excel。")
 else:
-    # 數值預處理
+    # 預運算月份數值
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     for m in months:
         df[m] = pd.to_numeric(df[m], errors='coerce').fillna(0)
     df['年度總額'] = df[months].sum(axis=1)
 
-    tab1, tab2, tab3 = st.tabs(["🚀 專案推進卡片", "📉 營收分類分析", "📝 原始明細檢視"])
+    tab1, tab2, tab3 = st.tabs(["🚀 專案推進看板", "📈 營收分類彙整", "📝 原始數據細目"])
 
-    # --- Tab 1: 各專案推進營收 ---
+    # --- Tab 1: 專案推進看板 (CSS 加強版) ---
     with tab1:
-        projects = [p for p in df['專案說明'].unique() if p and str(p) != 'None']
+        projects = [p for p in df['專案說明'].unique() if p and "序號" not in str(p)]
         cols = st.columns(2)
         
         for i, project in enumerate(projects):
-            p_rows = df[df['專案說明'] == project]
-            # 目標 (收入 灰底)
-            target_rev = p_rows[p_rows['紀錄類型'] == '收入']['年度總額'].sum()
-            # 預估 (收入預估 粉底)
-            est_rev = p_rows[p_rows['紀錄類型'].str.contains('預估', na=False) & p_rows['紀錄類型'].str.contains('收入', na=False)]['年度總額'].sum()
-            # 推進率
+            p_data = df[df['專案說明'] == project]
+            # 邏輯：同專案下第一筆「收入」為目標，第二筆為預估 (對應你的 Excel 順序)
+            income_rows = p_data[p_data['紀錄類型'].str.contains('收入', na=False)]
+            
+            target_rev = income_rows.iloc[0]['年度總額'] if len(income_rows) > 0 else 0
+            est_rev = income_rows.iloc[1]['年度總額'] if len(income_rows) > 1 else target_rev
+            
             rate = (est_rev / target_rev) if target_rev > 0 else 0
             
             with cols[i % 2]:
-                # 使用自定義 project-card 類別加深底色
                 st.markdown(f"""
                 <div class="project-card">
-                    <div class="project-title">{project}</div>
-                    <span class="category-label">{p_rows['營收分類'].iloc[0]}</span>
-                    <hr>
+                    <h3 style='margin-top:0;'>{project}</h3>
+                    <p style='color:gray;'>分類：{p_data['營收分類'].iloc[0] if not p_data.empty else 'N/A'}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
                 m1, m2, m3 = st.columns(3)
-                m1.metric("目標營收 (灰)", f"${target_rev:,.0f}")
-                m2.metric("預估收入 (粉)", f"${est_rev:,.0f}")
-                m3.metric("目標推進率", f"{rate:.1%}")
+                m1.metric("目標營收 (灰底)", f"${target_rev:,.0f}")
+                m2.metric("預估收入 (粉底)", f"${est_rev:,.0f}")
+                m3.metric("達成率", f"{rate:.1%}")
                 st.progress(min(rate, 1.0) if rate >= 0 else 0)
+                st.write("") # 間距
 
-    # --- Tab 2: 營收分類分析表 ---
+    # --- Tab 2: 營收分類彙整表 (精確毛利計算) ---
     with tab2:
-        st.subheader("📊 營收分類分析表")
+        st.subheader("各類別營收毛利彙整")
         
-        # 執行加總計算 (嚴格執行你的財務公式)
-        cat_summary = []
-        categories = df['營收分類'].unique()
-        
-        for cat in categories:
-            c_df = df[df['營收分類'] == cat]
+        summary_list = []
+        for cat in df['營收分類'].unique():
+            cat_df = df[df['營營分類'] == cat]
             
-            target_in = c_df[c_df['紀錄類型'] == '收入']['年度總額'].sum()
-            est_in = c_df[c_df['紀錄類型'].str.contains('收入', na=False) & c_df['紀錄類型'].str.contains('預估', na=False)]['年度總額'].sum()
-            target_out = c_df[c_df['紀錄類型'] == '支出']['年度總額'].sum()
-            est_out = c_df[c_df['紀錄類型'].str.contains('支出', na=False) & c_df['紀錄類型'].str.contains('預估', na=False)]['年度總額'].sum()
+            # 初始化各項指標
+            target_rev_sum = 0
+            est_rev_sum = 0
+            target_exp_sum = 0
+            est_exp_sum = 0
             
-            # 1. 目標毛利 = 目標收入 - 支出 (白底)
-            target_gp = target_in - target_out
-            # 2. 預估毛利 = 收入預估 - 支出預估 (粉底)
-            est_gp = est_in - est_out
-            # 3. 預估毛利率 = 預估毛利 / 預估收入
-            est_gp_rate = (est_gp / est_in) if est_in != 0 else 0
-            # 4. 差異 = 目標收入 - 預估收入
-            diff = target_in - est_in
+            # 按專案分組計算，以對應「第1筆是目標、第2筆是預估」的結構
+            for proj in cat_df['專案說明'].unique():
+                proj_df = cat_df[cat_df['專案說明'] == proj]
+                
+                # 收入類
+                incomes = proj_df[proj_df['紀錄類型'].str.contains('收入', na=False)]
+                target_rev_sum += incomes.iloc[0]['年度總額'] if len(incomes) > 0 else 0
+                est_rev_sum += incomes.iloc[1]['年度總額'] if len(incomes) > 1 else (incomes.iloc[0]['年度總額'] if len(incomes) > 0 else 0)
+                
+                # 支出類
+                exps = proj_df[proj_df['紀錄類型'].str.contains('支出', na=False)]
+                target_exp_sum += exps.iloc[0]['年度總額'] if len(exps) > 0 else 0
+                est_exp_sum += exps.iloc[1]['年度總額'] if len(exps) > 1 else (exps.iloc[0]['年度總額'] if len(exps) > 0 else 0)
             
-            cat_summary.append({
+            # 計算財務指標
+            target_gp = target_rev_sum - target_exp_sum
+            est_gp = est_rev_sum - est_exp_sum
+            est_margin = (est_gp / est_rev_sum) if est_rev_sum != 0 else 0
+            diff = target_rev_sum - est_rev_sum
+            
+            summary_list.append({
                 "營收分類": cat,
-                "目標收入": target_in,
-                "預估收入": est_in,
+                "目標收入": target_rev_sum,
+                "預估收入": est_rev_sum,
                 "目標毛利": target_gp,
                 "預估毛利": est_gp,
-                "預估毛利率": est_gp_rate,
-                "差異 (目標-預估)": diff
+                "預估毛利率": est_margin,
+                "差異(目標-預估)": diff
             })
         
-        report_df = pd.DataFrame(cat_summary)
+        report_df = pd.DataFrame(summary_list)
         
-        # 樣式設定：差異大於 0 (表示預估不如目標) 則標紅
+        # 格式化呈現
         st.dataframe(
             report_df.style.format({
-                "目標收入": "${:,.0f}", "預估收入": "${:,.0f}",
-                "目標毛利": "${:,.0f}", "預估毛利": "${:,.0f}",
-                "預估毛利率": "{:.1%}", "差異 (目標-預估)": "${:,.0f}"
-            }).map(lambda x: 'color: red' if x > 0 else 'color: green', subset=['差異 (目標-預估)']),
+                "目標收入": "{:,.0f}",
+                "預估收入": "{:,.0f}",
+                "目標毛利": "{:,.0f}",
+                "預估毛利": "{:,.0f}",
+                "預估毛利率": "{:.2%}",
+                "差異(目標-預估)": "{:,.0f}"
+            }).background_gradient(cmap="RdYlGn_r", subset=["差異(目標-預估)"]),
             use_container_width=True
         )
 
-    # --- Tab 3: 原始數據 ---
     with tab3:
         st.dataframe(df, use_container_width=True)
